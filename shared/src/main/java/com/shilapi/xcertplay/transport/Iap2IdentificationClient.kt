@@ -2,6 +2,7 @@ package com.shilapi.xcertplay.transport
 
 import com.shilapi.xcertplay.iap2.body.Iap2BodyReader
 import com.shilapi.xcertplay.iap2.catalog.Iap2Endpoints
+import com.shilapi.xcertplay.iap2.message.Iap2ControlMessages
 import com.shilapi.xcertplay.iap2.message.Iap2HidMessages
 import com.shilapi.xcertplay.iap2.message.Iap2Messages
 import com.shilapi.xcertplay.iap2.session.Iap2Session
@@ -251,6 +252,14 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
                         void(5)
                     }
                 }
+                group(30) {
+                    u16(0, Iap2ControlMessages.ROUTE_GUIDANCE_COMPONENT_ID)
+                    string(1, "RouteGuidance")
+                    // Without these limits the iPhone may omit road names from 0x5201/0x5202.
+                    u16(2, ROUTE_GUIDANCE_ROAD_NAME_LENGTH) // MaxCurrentRoadNameLength
+                    u16(4, ROUTE_GUIDANCE_ROAD_NAME_LENGTH) // MaxAfterManeuverRoadNameLength
+                    u16(6, ROUTE_GUIDANCE_MANEUVER_STORAGE) // MaxGuidanceManeuverStorageCapacity
+                }
             }
         }
 
@@ -290,6 +299,8 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
             0x4300, // CarPlayAvailability
             0x6801, // DeviceHIDReport (phone→accessory reply required once StartHID is declared)
         )
+        private const val ROUTE_GUIDANCE_ROAD_NAME_LENGTH = 64
+        private const val ROUTE_GUIDANCE_MANEUVER_STORAGE = 8
         private const val POWER_SOURCE_UPDATE = 0xae03
         private const val ACCESSORY_WIFI_CONFIGURATION_INFORMATION = 0x5703
         private const val LOCATION_INFORMATION = 0xfffb
