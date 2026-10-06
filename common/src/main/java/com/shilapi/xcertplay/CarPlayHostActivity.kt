@@ -2557,6 +2557,8 @@ class CarPlayHostActivity : ComponentActivity() {
             appendLog("EVENT log/synology_upload result=rejected")
             Toast.makeText(this, "The upload could not be started", Toast.LENGTH_LONG).show()
         }
+    }
+
     private fun buildMediaMetricsSection(): View =
         settingsSwitchRow(
             label = "Media latency monitor",
