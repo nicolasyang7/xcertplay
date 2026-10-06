@@ -1,0 +1,342 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  docker-build:
+    name: Docker image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          tags: ghcr.io/${{ github.repository }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export image digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-merge:
+    name: Publish Docker manifest
+    needs: docker-build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and verify multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${{ github.repository }}"
+          sources=()
+          for digest in *; do
+            sources+=("${image}@sha256:${digest}")
+          done
+          docker buildx imagetools create \
+            -t "${image}:${{ github.ref_name }}" \
+            -t "${image}:latest" \
+            "${sources[@]}"
+          docker buildx imagetools inspect "${image}:${{ github.ref_name }}"
+
+  host-binaries:
+    name: Host binary (${{ matrix.arch }}/${{ matrix.libc }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            libc: glibc
+            runner: ubuntu-22.04
+          - arch: arm64
+            libc: glibc
+            runner: ubuntu-22.04-arm
+          - arch: amd64
+            libc: musl
+            runner: ubuntu-22.04
+            image: golang:1.23-alpine3.20
+          - arch: arm64
+            libc: musl
+            runner: ubuntu-22.04-arm
+            image: golang:1.23-alpine3.20
+          - arch: arm
+            libc: merlin
+            runner: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        if: matrix.libc == 'glibc' || matrix.libc == 'merlin'
+        with:
+          go-version: "1.23.x"
+          cache: true
+
+      - name: Build glibc binary natively
+        if: matrix.libc == 'glibc'
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+          TARGET_LIBC: ${{ matrix.libc }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
+          make build OUTPUT="dist/linux_${TARGET_ARCH}_${TARGET_LIBC}/remote-mfi-for-xcertplay"
+
+      - name: Build musl binary natively
+        if: matrix.libc == 'musl'
+        env:
+          BUILD_IMAGE: ${{ matrix.image }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          TARGET_LIBC: ${{ matrix.libc }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e VERSION -e COMMIT \
+            -e OUTPUT="dist/linux_${TARGET_ARCH}_${TARGET_LIBC}/remote-mfi-for-xcertplay" \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            "${BUILD_IMAGE}" \
+            sh -ec 'apk add --no-cache build-base libusb-dev=1.0.27-r0 pkgconfig
+              make build'
+
+      - name: Build merlin binary via am-toolchains cross compiler
+        if: matrix.libc == 'merlin'
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+          TARGET_LIBC: ${{ matrix.libc }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          TOOLCHAIN_SUBDIR: brcm-arm-hnd/crosstools-arm-gcc-5.5-linux-4.1-glibc-2.26-binutils-2.28.1
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # The Buildroot 2017 host tools in am-toolchains are 32-bit ELF
+          # binaries with old SONAME dependencies (libmpc.so.3, libmpfr.so.4),
+          # and the target binary is aarch64 with cgo.
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          # Native (amd64) tools plus 32-bit runtime libraries for cc1.
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config curl \
+            libc6:i386 zlib1g:i386 libgmp10:i386
+          # The Buildroot 2017 host tools in am-toolchains are 32-bit ELF
+          # binaries that link against old SONAMEs (libmpc.so.3, libmpfr.so.4)
+          # that jammy no longer ships. Pull the matching bionic .debs from
+          # Ubuntu's old-releases archive into /usr/local/lib/i386-linux-gnu
+          # so cc1 can dlopen them without polluting the system linker cache.
+          MERLIN_LIB_DIR=/usr/local/lib/i386-linux-gnu-merlin
+          sudo mkdir -p "$MERLIN_LIB_DIR"
+          tmp=$(mktemp -d)
+          for url in \
+            "http://old-releases.ubuntu.com/ubuntu/pool/main/m/mpfr4/libmpfr4_3.1.6-1_i386.deb" \
+            "http://old-releases.ubuntu.com/ubuntu/pool/main/m/mpclib3/libmpc3_1.0.3-2_i386.deb" \
+          ; do
+            curl -fsSL -o "$tmp/$(basename "$url")" "$url"
+            (cd "$tmp" && dpkg-deb -x "$(basename "$url")" extracted && \
+              sudo cp -a extracted/usr/lib/i386-linux-gnu/. "$MERLIN_LIB_DIR/" && \
+              rm -rf extracted "$(basename "$url")")
+          done
+          rm -rf "$tmp"
+          ls "$MERLIN_LIB_DIR"
+          export LD_LIBRARY_PATH="$MERLIN_LIB_DIR:${LD_LIBRARY_PATH:-}"
+          # Sparse-clone the Asuswrt-Merlin aarch64 crosstools that match the
+          # firmware's Buildroot glibc 2.26 (HND 5.02L, kernel 4.1).
+          sudo mkdir -p /opt/am-toolchains
+          sudo chown "$(id -u):$(id -g)" /opt/am-toolchains
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/RMerl/am-toolchains.git /opt/am-toolchains
+          git -C /opt/am-toolchains sparse-checkout set "${TOOLCHAIN_SUBDIR}"
+          TC="/opt/am-toolchains/${TOOLCHAIN_SUBDIR}"
+          # Report the shared library dependencies of cc1 so unexpected
+          # missing SONAMEs surface loudly instead of causing a `make build`
+          # trailing failure.
+          cc1_bin="${TC}/libexec/gcc/arm-buildroot-linux-gnueabi/5.5.0/cc1"
+          file "$cc1_bin"
+          if ! LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ldd "$cc1_bin"; then
+            echo "cc1 ldd failed; check the trailing errors above" >&2
+            exit 1
+          fi
+          "${TC}/bin/arm-buildroot-linux-gnueabi-gcc" --version | head -1
+          export CC="${TC}/bin/arm-buildroot-linux-gnueabi-gcc"
+          export CXX="${TC}/bin/arm-buildroot-linux-gnueabi-g++"
+          export AR="${TC}/bin/arm-buildroot-linux-gnueabi-ar"
+          export GOOS=linux
+          export GOARCH=arm
+          export GOARM=7
+          export CGO_ENABLED=1
+          # Cross-build libusb 1.0.24 (matches Merlin 388.x firmware) so cgo
+          # has an armv7 -lusb-1.0 that only depends on libc + libpthread
+          # (no libudev, no glibc 2.34+ symbols). The runtime SONAME
+          # libusb-1.0.so.0 is supplied by the router itself.
+          LIBUSB_PREFIX=/opt/libusb-merlin
+          if [ ! -e "$LIBUSB_PREFIX/lib/libusb-1.0.so" ]; then
+            mkdir -p /tmp/libusb-src
+            curl -fsSL -o /tmp/libusb-src.tar.bz2 \
+              https://github.com/libusb/libusb/releases/download/v1.0.24/libusb-1.0.24.tar.bz2
+            tar -xjf /tmp/libusb-src.tar.bz2 -C /tmp/libusb-src --strip-components=1
+            (
+              cd /tmp/libusb-src
+              ./configure \
+                --host=arm-buildroot-linux-gnueabi \
+                --prefix="$LIBUSB_PREFIX" \
+                --disable-udev --disable-static
+              make -j"$(nproc)"
+              sudo make install
+            )
+          fi
+          export PKG_CONFIG_PATH="$LIBUSB_PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$LIBUSB_PREFIX/lib/pkgconfig"
+          unset PKG_CONFIG_SYSROOT_DIR
+          make build OUTPUT="dist/linux_${TARGET_ARCH}_${TARGET_LIBC}/remote-mfi-for-xcertplay"
+          # Confirm the binary needs no GLIBC symbol newer than 2.26.
+          OUT="dist/linux_${TARGET_ARCH}_${TARGET_LIBC}/remote-mfi-for-xcertplay"
+          "${TC}/bin/arm-buildroot-linux-gnueabi-objdump" -T "${OUT}" > /tmp/dt.txt
+          awk '{print $5}' /tmp/dt.txt | grep -E '^GLIBC_[0-9]+\.[0-9]+' | sort -u > /tmp/glibc-refs.txt || true
+          echo "GLIBC symbol references:"
+          cat /tmp/glibc-refs.txt
+          awk -F. '{ if ($1 != "GLIBC_2" || $2+0 > 26) { print $0; exit 1 } }' /tmp/glibc-refs.txt
+          # Confirm we do NOT link against libresolv.so.2, which Merlin firmware
+          # does not ship. netgo build tag keeps net/ off the cgo resolver path.
+          "${TC}/bin/arm-buildroot-linux-gnueabi-readelf" -d "${OUT}" > /tmp/dyn.txt
+          if grep -F 'libresolv.so.2' /tmp/dyn.txt; then
+            echo "unexpected dependency on libresolv.so.2" >&2
+            exit 1
+          fi
+          echo "NEEDED libraries:"
+          grep -E 'NEEDED' /tmp/dyn.txt
+
+      - name: Package binary
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+          TARGET_LIBC: ${{ matrix.libc }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          OUTPUT_DIR="dist/linux_${TARGET_ARCH}_${TARGET_LIBC}"
+          # Some build steps run inside Docker as container root, so hand
+          # ownership of dist back to the runner user before writing the
+          # tarball. This is a no-op when dist is already runner-owned.
+          if [ -e dist ] && [ "$(stat -c '%u' dist)" != "$(id -u)" ]; then
+            sudo chown -R "$(id -u):$(id -g)" dist
+          fi
+          cp README.md README.zh-CN.md LICENSE "${OUTPUT_DIR}/"
+          ARCHIVE="remote-mfi-for-xcertplay_${VERSION}_linux_${TARGET_ARCH}_${TARGET_LIBC}.tar.gz"
+          tar -C "${OUTPUT_DIR}" -czf "dist/${ARCHIVE}" remote-mfi-for-xcertplay README.md README.zh-CN.md LICENSE
+          (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: host-${{ matrix.arch }}-${{ matrix.libc }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [docker-merge, host-binaries]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: host-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify release files
+        run: |
+          set -euo pipefail
+          test "$(find release -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
+          test "$(find release -maxdepth 1 -name '*.sha256' | wc -l)" -eq 5
+          (cd release && sha256sum -c *.sha256)
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/*.sha256
+          body: |
+            Docker image:
+
+            ```sh
+            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ```
+
+            Platforms: `linux/amd64`, `linux/arm64`.
+
+            Host binaries are dynamically linked against libusb and are provided for:
+
+            - `linux_amd64_glibc`, `linux_arm64_glibc` — glibc ≥ 2.35 (Ubuntu 22.04 baseline).
+            - `linux_amd64_musl`, `linux_arm64_musl` — Alpine 3.20 baseline.
+            - `linux_arm_merlin` — cross-built with the official
+              Asuswrt-Merlin `am-toolchains` armv7 crosstools (glibc 2.26).
+              Runs on RT-AX86U 388.x and other Merlin HND 5.02L routers
+              (the kernel is aarch64 but the userspace is armv7l);
+              dynamically links against the firmware-provided
+              `libusb-1.0.so.0`.

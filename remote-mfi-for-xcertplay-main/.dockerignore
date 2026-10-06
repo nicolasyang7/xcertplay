@@ -1,0 +1,7 @@
+.git
+.github
+dist
+remote-mfi-for-xcertplay
+*.test
+*.out
+.DS_Store
