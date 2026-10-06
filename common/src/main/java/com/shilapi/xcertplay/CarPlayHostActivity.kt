@@ -327,8 +327,6 @@ class CarPlayHostActivity : ComponentActivity() {
     private var wirelessTransportSwitch: Switch? = null
     private var localMfiCertificateDocumentView: TextView? = null
     private var localMfiPrivateKeyDocumentView: TextView? = null
-    private var settingsBaseline: SettingsBaseline? = null
-    private var locationReportingSwitch: Switch? = null
     private var mainMediaAudioBufferSeekBar: SeekBar? = null
     private var mainMediaAudioBufferValueView: TextView? = null
     private var microphoneGainSeekBar: SeekBar? = null
