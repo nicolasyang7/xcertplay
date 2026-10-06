@@ -40,12 +40,21 @@ jobs:
       # No signing secrets: ANDROID_KEYSTORE_PATH is left unset, so debug builds use
       # the default Android debug key.
       - name: Unit tests and debug APKs
-        run: >-
-          ./gradlew
-          :shared:testDebugUnitTest
-          :mobile:assembleDebug
-          :automotive:assembleDebug
-          --stacktrace
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew :shared:testDebugUnitTest :mobile:assembleDebug :automotive:assembleDebug \
+            --stacktrace --console=plain 2>&1 | tee build.log
+
+      # Surface the key errors as annotations so they can be read without a log download.
+      - name: Report build errors
+        if: failure()
+        shell: bash
+        run: |
+          grep -nE '^e: |error:|What went wrong|FAILED|Execution failed|Could not' -A4 build.log \
+            | head -c 9000 > errors.txt || true
+          msg="$(sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g' errors.txt)"
+          echo "::error title=gradle-errors::${msg}"
 
       - name: Upload debug APKs
         uses: actions/upload-artifact@v4
