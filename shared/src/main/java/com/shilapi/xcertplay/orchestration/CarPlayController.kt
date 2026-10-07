@@ -369,17 +369,18 @@ class CarPlayController(
     }
 
     private fun activateMediaRemote(session: Iap2Session) {
-        CarPlayNavigationBridge.publish(navigation.reset())
         startFileTransferReceiver(session)
         activeMediaRemoteSession = session
         CarPlayMediaSessionBridge.setControlsAvailable(this, true)
     }
 
     private fun deactivateMediaRemote(session: Iap2Session) {
-        CarPlayNavigationBridge.publish(navigation.reset())
         stopFileTransferReceiver(session)
         if (activeMediaRemoteSession !== session) return
         activeMediaRemoteSession = null
+        // Route guidance is subscribed before onReady fires, and a wireless handoff stops the Bluetooth
+        // session after the tunnel took over, so reset only when the live session ends.
+        CarPlayNavigationBridge.publish(navigation.reset())
         CarPlayMediaSessionBridge.setControlsAvailable(this, false)
     }
 
