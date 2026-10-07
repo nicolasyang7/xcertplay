@@ -91,7 +91,7 @@ class Iap2NavigationTest {
         assertNull(state.distanceRemainingMeters)
         assertNull(state.distanceToNextManeuverMeters)
         assertNull(state.destinationName)
-        assertNull(state.arrivalRaw)
+        assertNull(state.arrivalEpochSeconds)
     }
 
     @Test
@@ -145,6 +145,52 @@ class Iap2NavigationTest {
         assertFalse(fresh.routeActive)
         assertNull(accumulator.current().nextManeuver)
         assertEquals(fresh.sessionId, accumulator.current().sessionId)
+    }
+
+    /** The two frames of an Amap CarPlay navigation trace, with the parameters that were logged. */
+    @Test
+    fun decodesTheAmapCarPlayTrace() {
+        val accumulator = Iap2NavigationAccumulator { 0L }
+        accumulator.update(
+            maneuverUpdate {
+                u16(0, 42)
+                u16(1, 0)
+                string(2, "进入 无名道路")
+                u8(3, 2)
+                string(4, "进入 无名道路")
+                u32(5, 1500)
+                string(6, "1.5")
+            },
+        )
+        val state = accumulator.update(
+            routeUpdate {
+                u16(0, 42)
+                u8(1, 1)
+                string(4, "未知位置")
+                u64(5, 1_791_011_797L)
+                u64(6, 5_520L)
+                u32(7, 126_900)
+                string(8, "127")
+                u32(10, 1_500)
+                string(11, "1.5")
+                u16(13, 0)
+                u16(14, 1)
+                string(19, "Amap")
+                u8(20, 1)
+            },
+        )!!
+
+        assertTrue(state.routeActive)
+        assertEquals("Amap", state.sourceName)
+        assertEquals("未知位置", state.destinationName)
+        assertEquals(1_791_011_797L, state.arrivalEpochSeconds)
+        assertEquals(5_520L, state.timeRemainingSeconds)
+        assertEquals(126_900L, state.distanceRemainingMeters)
+        assertEquals(1_500L, state.distanceToNextManeuverMeters)
+        assertEquals(1, state.maneuverCount)
+        assertEquals(2, state.nextManeuver?.type)
+        assertEquals("进入 无名道路", state.nextManeuver?.afterRoadName)
+        assertNull(state.currentRoadName)
     }
 
     @Test

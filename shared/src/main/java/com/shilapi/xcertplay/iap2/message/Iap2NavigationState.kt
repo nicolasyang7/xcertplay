@@ -18,8 +18,8 @@ data class Iap2Maneuver(
  * A `null` field means the iPhone has not reported it for this route. It is never a zero: consumers
  * must omit it rather than render 0 or clear a value another source supplied.
  *
- * [arrivalRaw] and [timeRemainingRaw] keep the wire value because the unit is not confirmed on a
- * real device; DiPlay treats them as seconds, so convert only after capturing a trace.
+ * [arrivalEpochSeconds] and [timeRemainingSeconds] are seconds: confirmed against an Amap CarPlay
+ * trace, where the arrival epoch equalled the frame time plus the reported remaining time.
  */
 data class Iap2NavigationState(
     /** Increments whenever the iPhone session changes, so consumers can drop stale callbacks. */
@@ -30,8 +30,10 @@ data class Iap2NavigationState(
     val maneuverState: Int? = null,
     val currentRoadName: String? = null,
     val destinationName: String? = null,
-    val arrivalRaw: Long? = null,
-    val timeRemainingRaw: Long? = null,
+    /** The guiding app as the phone names it (an Amap trace reported "Amap"). */
+    val sourceName: String? = null,
+    val arrivalEpochSeconds: Long? = null,
+    val timeRemainingSeconds: Long? = null,
     val distanceRemainingMeters: Long? = null,
     val distanceToNextManeuverMeters: Long? = null,
     val maneuverCount: Int? = null,
@@ -95,8 +97,11 @@ class Iap2NavigationAccumulator(
             maneuverState = body.optionalU8(MANEUVER_STATE) ?: state.maneuverState,
             currentRoadName = body.optionalString(CURRENT_ROAD_NAME) ?: state.currentRoadName,
             destinationName = body.optionalString(DESTINATION_NAME) ?: state.destinationName,
-            arrivalRaw = body.optionalU64(ESTIMATED_ARRIVAL)?.takeIf { it > 0 } ?: state.arrivalRaw,
-            timeRemainingRaw = body.optionalU64(TIME_REMAINING)?.takeIf { it >= 0 } ?: state.timeRemainingRaw,
+            sourceName = body.optionalString(SOURCE_NAME) ?: state.sourceName,
+            arrivalEpochSeconds =
+                body.optionalU64(ESTIMATED_ARRIVAL)?.takeIf { it > 0 } ?: state.arrivalEpochSeconds,
+            timeRemainingSeconds =
+                body.optionalU64(TIME_REMAINING)?.takeIf { it >= 0 } ?: state.timeRemainingSeconds,
             distanceRemainingMeters = body.optionalU32(DISTANCE_REMAINING) ?: state.distanceRemainingMeters,
             distanceToNextManeuverMeters =
                 body.optionalU32(DISTANCE_TO_NEXT_MANEUVER) ?: state.distanceToNextManeuverMeters,
@@ -131,8 +136,9 @@ class Iap2NavigationAccumulator(
         private const val NO_ROUTE_SET = 0
         private const val ARRIVED = 2
 
-        // RouteGuidanceUpdate parameters. 1, 3, 5, 6, 7, 10 and 13 are the ones DiPlay decodes on a real
-        // phone; 2, 4 and 14 follow the reference body but are not yet confirmed on a device.
+        // RouteGuidanceUpdate parameters. 1, 4, 5, 6, 7, 10, 13, 14 and 19 were seen in an Amap CarPlay
+        // trace and 3 is decoded by DiPlay; 2 (ManeuverState) follows the reference body but has not
+        // yet appeared in a trace.
         private const val GUIDANCE_STATE = 1
         private const val MANEUVER_STATE = 2
         private const val CURRENT_ROAD_NAME = 3
@@ -143,8 +149,9 @@ class Iap2NavigationAccumulator(
         private const val DISTANCE_TO_NEXT_MANEUVER = 10
         private const val CURRENT_MANEUVER_LIST = 13
         private const val MANEUVER_COUNT = 14
+        private const val SOURCE_NAME = 19
 
-        // RouteGuidanceManeuverUpdate parameters (2 is unconfirmed on a device).
+        // RouteGuidanceManeuverUpdate parameters; 1 to 4 were seen in the same Amap trace.
         private const val MANEUVER_INDEX = 1
         private const val MANEUVER_DESCRIPTION = 2
         private const val MANEUVER_TYPE = 3
