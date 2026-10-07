@@ -30,13 +30,11 @@ import com.shilapi.xcertplay.airplay.AirPlaySessionListener
 import com.shilapi.xcertplay.airplay.PairingStore
 import com.shilapi.xcertplay.iap2.message.Iap2HidMessages
 import com.shilapi.xcertplay.iap2.message.Iap2MediaRemoteCommand
-import com.shilapi.xcertplay.iap2.message.Iap2NavigationAccumulator
 import com.shilapi.xcertplay.iap2.message.Iap2NowPlayingAccumulator
 import com.shilapi.xcertplay.iap2.session.Iap2FileTransferReceiver
 import com.shilapi.xcertplay.iap2.session.Iap2Session
 import com.shilapi.xcertplay.iap2.wire.Iap2Frame
 import com.shilapi.xcertplay.media.CarPlayMediaSessionBridge
-import com.shilapi.xcertplay.navigation.CarPlayNavigationBridge
 import com.shilapi.xcertplay.mfi.Iap2MfiAuthenticationClient
 import com.shilapi.xcertplay.mfi.LocalMfiAuthenticationClient
 import com.shilapi.xcertplay.mfi.MfiAuthenticationClient
@@ -213,7 +211,6 @@ class CarPlayController(
     private val wirelessActiveReported = AtomicBoolean(false)
     private val wirelessGeneration = AtomicInteger(0)
     private val nowPlaying = Iap2NowPlayingAccumulator()
-    private val navigation = Iap2NavigationAccumulator()
 
     private var permissionCloseable: Closeable? = null
     private var attachCloseable: Closeable? = null
@@ -352,19 +349,11 @@ class CarPlayController(
     }
 
     private fun onIap2Incoming(frame: Iap2Frame) {
-        when (frame.messageId) {
-            NOW_PLAYING_UPDATE -> try {
-                CarPlayMediaSessionBridge.publish(this, nowPlaying.update(frame))
-            } catch (error: RuntimeException) {
-                debugLog("Could not decode iAP2 NowPlayingUpdate", error)
-            }
-            Iap2NavigationAccumulator.ROUTE_GUIDANCE_UPDATE,
-            Iap2NavigationAccumulator.ROUTE_GUIDANCE_MANEUVER_UPDATE,
-            -> try {
-                navigation.update(frame)?.let(CarPlayNavigationBridge::publish)
-            } catch (error: Exception) {
-                debugLog("Could not decode iAP2 route guidance 0x${frame.messageId.toString(16)}", error)
-            }
+        if (frame.messageId != NOW_PLAYING_UPDATE) return
+        try {
+            CarPlayMediaSessionBridge.publish(this, nowPlaying.update(frame))
+        } catch (error: RuntimeException) {
+            debugLog("Could not decode iAP2 NowPlayingUpdate", error)
         }
     }
 
@@ -378,9 +367,6 @@ class CarPlayController(
         stopFileTransferReceiver(session)
         if (activeMediaRemoteSession !== session) return
         activeMediaRemoteSession = null
-        // Route guidance is subscribed before onReady fires, and a wireless handoff stops the Bluetooth
-        // session after the tunnel took over, so reset only when the live session ends.
-        CarPlayNavigationBridge.publish(navigation.reset())
         CarPlayMediaSessionBridge.setControlsAvailable(this, false)
     }
 
