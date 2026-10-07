@@ -193,6 +193,45 @@ class Iap2NavigationTest {
         assertNull(state.currentRoadName)
     }
 
+    /** The burst the phone sent when the route was set, in the order it arrived. */
+    @Test
+    fun theRealBurstBecomesGuidanceOnlyOnceTheRouteIsComputed() {
+        val accumulator = Iap2NavigationAccumulator { 0L }
+        val started = accumulator.update(
+            routeUpdate { u16(0, 42); u8(1, 3); string(4, "未知位置"); u16(14, 0); u8(15, 1); string(19, "Amap"); u8(20, 1) },
+        )!!
+        assertFalse(started.hasGuidance)
+
+        // ETA is "now" and the remaining time is 0 until the route exists: not data.
+        val placeholder = accumulator.update(
+            routeUpdate { u16(0, 42); u8(1, 1); string(4, "未知位置"); u64(5, 1_791_006_277L); u64(6, 0L) },
+        )!!
+        assertNull(placeholder.arrivalEpochSeconds)
+        assertNull(placeholder.timeRemainingSeconds)
+
+        val timed = accumulator.update(
+            routeUpdate { u64(5, 1_791_011_797L); u64(6, 5_520L); u32(7, 126_900); string(8, "127") },
+        )!!
+        assertEquals(5_520L, timed.timeRemainingSeconds)
+        assertFalse(timed.hasGuidance)
+
+        // The maneuver details arrive before the update that names the current maneuver; the
+        // unit and driving side parameters are a single zero byte.
+        accumulator.update(
+            maneuverUpdate {
+                u16(0, 42); u16(1, 0); string(2, "进入 无名道路"); u8(3, 2); string(4, "进入 无名道路")
+                u32(5, 1500); string(6, "1.5"); u8(7, 0); u8(8, 0); u8(9, 0)
+            },
+        )
+        accumulator.update(routeUpdate { u16(14, 1) })
+        accumulator.update(routeUpdate { u16(13, 0) })
+        val full = accumulator.update(routeUpdate { u32(10, 1_500); string(11, "1.5"); u8(12, 0) })!!
+
+        assertTrue(full.hasGuidance)
+        assertEquals(0, full.nextManeuver?.drivingSide)
+        assertEquals(2, full.nextManeuver?.type)
+    }
+
     @Test
     fun otherMessagesAreIgnored() {
         val accumulator = Iap2NavigationAccumulator { 0L }

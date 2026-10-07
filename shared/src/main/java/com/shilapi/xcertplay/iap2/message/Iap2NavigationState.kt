@@ -40,7 +40,14 @@ data class Iap2NavigationState(
     /** Maneuver the driver is approaching; `null` until its 0x5202 details have arrived. */
     val nextManeuver: Iap2Maneuver? = null,
     val updatedAtRealtimeMillis: Long = 0,
-)
+) {
+    /**
+     * True once there is something to show. The phone reports state 3 and then partial updates before
+     * the route is computed, so [routeActive] alone is too early to drive a display.
+     */
+    val hasGuidance: Boolean
+        get() = routeActive && distanceRemainingMeters != null && nextManeuver?.type != null
+}
 
 /**
  * Merges incremental route-guidance updates (the iPhone omits attributes that did not change).
@@ -91,6 +98,10 @@ class Iap2NavigationAccumulator(
             return state
         }
         body.optionalU16List(CURRENT_MANEUVER_LIST)?.firstOrNull()?.let { activeIndex = it }
+        // Before the route is computed the phone sends an arrival equal to "now" with 0 remaining time.
+        // Neither is data, and the real arrival is signalled by the Arrived state instead.
+        val remaining = body.optionalU64(TIME_REMAINING)
+        val placeholderTiming = remaining == 0L
         state = state.copy(
             routeActive = true,
             guidanceState = guidanceState ?: state.guidanceState,
@@ -98,10 +109,12 @@ class Iap2NavigationAccumulator(
             currentRoadName = body.optionalString(CURRENT_ROAD_NAME) ?: state.currentRoadName,
             destinationName = body.optionalString(DESTINATION_NAME) ?: state.destinationName,
             sourceName = body.optionalString(SOURCE_NAME) ?: state.sourceName,
-            arrivalEpochSeconds =
-                body.optionalU64(ESTIMATED_ARRIVAL)?.takeIf { it > 0 } ?: state.arrivalEpochSeconds,
-            timeRemainingSeconds =
-                body.optionalU64(TIME_REMAINING)?.takeIf { it >= 0 } ?: state.timeRemainingSeconds,
+            arrivalEpochSeconds = if (placeholderTiming) {
+                state.arrivalEpochSeconds
+            } else {
+                body.optionalU64(ESTIMATED_ARRIVAL)?.takeIf { it > 0 } ?: state.arrivalEpochSeconds
+            },
+            timeRemainingSeconds = if (placeholderTiming) state.timeRemainingSeconds else remaining ?: state.timeRemainingSeconds,
             distanceRemainingMeters = body.optionalU32(DISTANCE_REMAINING) ?: state.distanceRemainingMeters,
             distanceToNextManeuverMeters =
                 body.optionalU32(DISTANCE_TO_NEXT_MANEUVER) ?: state.distanceToNextManeuverMeters,
@@ -121,13 +134,16 @@ class Iap2NavigationAccumulator(
             type = body.optionalU8(MANEUVER_TYPE) ?: previous?.type,
             description = body.optionalString(MANEUVER_DESCRIPTION) ?: previous?.description,
             afterRoadName = body.optionalString(AFTER_MANEUVER_ROAD_NAME) ?: previous?.afterRoadName,
-            drivingSide = body.optionalU8(DRIVING_SIDE) ?: previous?.drivingSide,
+            drivingSide = lenientByte(body.optionalRaw(DRIVING_SIDE)) ?: previous?.drivingSide,
         )
         if (index == activeIndex) {
             state = state.copy(nextManeuver = maneuvers[index], updatedAtRealtimeMillis = realtimeMillis())
         }
         return state
     }
+
+    /** A single byte, else null: the phone's logs show a zero byte where a one-byte value is absent or 0. */
+    private fun lenientByte(raw: ByteArray?): Int? = raw?.takeIf { it.size == 1 }?.let { it[0].toInt() and 0xff }
 
     companion object {
         const val ROUTE_GUIDANCE_UPDATE = 0x5201
