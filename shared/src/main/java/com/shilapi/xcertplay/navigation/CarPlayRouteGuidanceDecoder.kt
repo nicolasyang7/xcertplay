@@ -12,6 +12,7 @@ class CarPlayRouteGuidanceDecoder(
 ) {
     private var currentGuidance = CarPlayNavigationUpdate(isActive = false)
     private val maneuverMap = mutableMapOf<Int, CarPlayManeuver>()
+    private var currentManeuverIds: List<Int> = emptyList()
 
     /**
      * Inspects an incoming iAP2 frame. If it is a route guidance message, decodes it and dispatches
@@ -43,136 +44,118 @@ class CarPlayRouteGuidanceDecoder(
 
     fun resetNavigation() {
         maneuverMap.clear()
+        currentManeuverIds = emptyList()
         currentGuidance = CarPlayNavigationUpdate(isActive = false)
         onNavigationUpdate(currentGuidance)
     }
 
+    // 0x5201 RouteGuidanceUpdate parameter ids (see docs/iap2-route-guidance-fields.md).
     private fun decodeRouteGuidanceUpdate(frame: Iap2Frame) {
         try {
             val reader = Iap2BodyReader.of(frame)
-            val currentRoad = reader.optionalString(0)
-            val destination = reader.optionalString(1)
-            val totalRemainDis = reader.optionalU32(2)?.toInt()
-            val totalRemainTime = reader.optionalU32(3)?.toInt()
-            val distToNextManeuver = reader.optionalU32(4)?.toInt()
-            val state = reader.optionalU8(5) // 0: inactive, 1: active, 2: rerouting, 3: arrived
-
-            val isActive = state == null || state == 1 || state == 2
-            val isRerouting = state == 2
-
-            if (state == 0 || state == 3) {
-                // Navigation ended or arrived
+            val state = reader.optionalU8(P_STATE)
+            // 0 = not active, 2 = arrived; anything else keeps guidance running.
+            if (state == STATE_NOT_ACTIVE || state == STATE_ARRIVED) {
                 resetNavigation()
                 return
             }
+            val currentRoad = reader.optionalString(P_CURRENT_ROAD)
+            val destination = reader.optionalString(P_DESTINATION)
+            val remainingMillis = reader.optionalU64(P_TIME_REMAINING)
+            val totalRemainDis = reader.optionalU32(P_DISTANCE_REMAINING)?.toInt()
+            val distToNextManeuver = reader.optionalU32(P_DISTANCE_TO_NEXT)?.toInt()
+            val maneuverList = reader.optionalU16List(P_MANEUVER_LIST)
 
-            currentGuidance = currentGuidance.copy(
-                isActive = isActive,
-                isRerouting = isRerouting,
-                currentRoadName = currentRoad ?: currentGuidance.currentRoadName,
-                destinationName = destination ?: currentGuidance.destinationName,
-                totalRemainingDistanceMeters = totalRemainDis ?: currentGuidance.totalRemainingDistanceMeters,
-                totalRemainingTimeSeconds = totalRemainTime ?: currentGuidance.totalRemainingTimeSeconds,
-                distanceToNextManeuverMeters = distToNextManeuver ?: currentGuidance.distanceToNextManeuverMeters,
-            )
-            onNavigationUpdate(currentGuidance)
-        } catch (e: Exception) {
-            // Guard against malformed TLV
-        }
-    }
-
-    private fun decodeRouteGuidanceManeuverUpdate(frame: Iap2Frame) {
-        try {
-            val reader = Iap2BodyReader.of(frame)
-            val index = reader.optionalU16(0) ?: 0
-            val rawType = reader.optionalU16(1) ?: reader.optionalU8(1) ?: 0
-            val turnAngle = reader.optionalI16(2)?.toFloat()
-            val instruction = reader.optionalString(3)
-            val roadName = reader.optionalString(4)
-            val distance = reader.optionalU32(5)?.toInt()
-            val exitNumber = reader.optionalString(6)
-
-            val maneuverType = mapRawManeuverType(rawType)
-            val maneuver = CarPlayManeuver(
-                index = index,
-                type = maneuverType,
-                rawType = rawType,
-                turnAngleDegrees = turnAngle,
-                instruction = instruction,
-                roadName = roadName,
-                distanceMeters = distance,
-                exitNumber = exitNumber,
-            )
-            maneuverMap[index] = maneuver
-
-            // The maneuver with smallest index >= 0 is typically the current/next upcoming turn
-            val upcoming = maneuverMap.values.sortedBy { it.index }
-            val currentManeuver = upcoming.firstOrNull()
+            if (maneuverList != null) currentManeuverIds = maneuverList
 
             currentGuidance = currentGuidance.copy(
                 isActive = true,
-                currentManeuver = currentManeuver,
-                upcomingManeuvers = upcoming,
-                nextRoadName = currentManeuver?.roadName ?: currentGuidance.nextRoadName,
-                distanceToNextManeuverMeters = currentManeuver?.distanceMeters ?: currentGuidance.distanceToNextManeuverMeters,
+                isRerouting = state == STATE_REROUTING,
+                currentRoadName = currentRoad ?: currentGuidance.currentRoadName,
+                destinationName = destination ?: currentGuidance.destinationName,
+                totalRemainingDistanceMeters = totalRemainDis ?: currentGuidance.totalRemainingDistanceMeters,
+                totalRemainingTimeSeconds = remainingMillis?.let { (it / 1000L).toInt() }
+                    ?: currentGuidance.totalRemainingTimeSeconds,
+                distanceToNextManeuverMeters = distToNextManeuver ?: currentGuidance.distanceToNextManeuverMeters,
             )
-            onNavigationUpdate(currentGuidance)
+            publishWithManeuvers()
         } catch (e: Exception) {
             // Guard against malformed TLV
         }
     }
 
-    private fun decodeLaneGuidanceUpdate(frame: Iap2Frame) {
+    // 0x5202 RouteGuidanceManeuverUpdate parameter ids.
+    private fun decodeRouteGuidanceManeuverUpdate(frame: Iap2Frame) {
         try {
             val reader = Iap2BodyReader.of(frame)
-            // Extract lane list if present
-            val lanes = mutableListOf<LaneDirection>()
-            if (reader.has(0)) {
-                // Group or byte-array representation of lanes
-                val laneGroup = reader.optionalGroup(0)
-                if (laneGroup != null) {
-                    val count = laneGroup.optionalU8(0) ?: 0
-                    for (i in 0 until count) {
-                        val dir = laneGroup.optionalU8(i + 1) ?: 1
-                        lanes.add(LaneDirection(directionCode = dir, isPreferred = true))
-                    }
-                }
-            }
-            if (lanes.isNotEmpty()) {
-                currentGuidance = currentGuidance.copy(
-                    laneGuidance = LaneGuidanceInfo(lanes = lanes, isHighlighted = true)
-                )
-                onNavigationUpdate(currentGuidance)
-            }
+            val index = reader.optionalU16(P_M_INDEX) ?: return
+            val rawType = reader.optionalU8(P_M_TYPE) ?: 0
+            maneuverMap[index] = CarPlayManeuver(
+                index = index,
+                type = mapRawManeuverType(rawType),
+                rawType = rawType,
+                instruction = reader.optionalString(P_M_DESCRIPTION),
+                roadName = reader.optionalString(P_M_AFTER_ROAD),
+                distanceMeters = reader.optionalU16(P_M_DISTANCE),
+                exitNumber = reader.optionalString(P_M_EXIT_INFO),
+            )
+            currentGuidance = currentGuidance.copy(isActive = true)
+            publishWithManeuvers()
         } catch (e: Exception) {
             // Guard against malformed TLV
         }
     }
 
-    private fun mapRawManeuverType(raw: Int): CarPlayManeuverType {
-        return when (raw) {
-            1 -> CarPlayManeuverType.CONTINUE
-            2 -> CarPlayManeuverType.STRAIGHT
-            3 -> CarPlayManeuverType.TURN_LEFT
-            4 -> CarPlayManeuverType.TURN_RIGHT
-            5 -> CarPlayManeuverType.TURN_SLIGHT_LEFT
-            6 -> CarPlayManeuverType.TURN_SLIGHT_RIGHT
-            7 -> CarPlayManeuverType.TURN_SHARP_LEFT
-            8 -> CarPlayManeuverType.TURN_SHARP_RIGHT
-            9 -> CarPlayManeuverType.U_TURN_LEFT
-            10 -> CarPlayManeuverType.U_TURN_RIGHT
-            11 -> CarPlayManeuverType.KEEP_LEFT
-            12 -> CarPlayManeuverType.KEEP_RIGHT
-            13 -> CarPlayManeuverType.ON_RAMP
-            14 -> CarPlayManeuverType.OFF_RAMP
-            15 -> CarPlayManeuverType.FORK_LEFT
-            16 -> CarPlayManeuverType.FORK_RIGHT
-            17 -> CarPlayManeuverType.MERGE_LEFT
-            18 -> CarPlayManeuverType.MERGE_RIGHT
-            19 -> CarPlayManeuverType.ROUNDABOUT_ENTER
-            20 -> CarPlayManeuverType.ROUNDABOUT_EXIT
-            21 -> CarPlayManeuverType.ARRIVED_AT_DESTINATION
-            else -> CarPlayManeuverType.UNKNOWN
-        }
+    // 0x5204 LaneGuidanceInfoUpdate: the laneInfoList children are not documented, so lane data is
+    // not decoded rather than guessed.
+    private fun decodeLaneGuidanceUpdate(frame: Iap2Frame) = Unit
+
+    private fun publishWithManeuvers() {
+        val ordered = maneuverMap.values.sortedBy { it.index }
+        val current = currentManeuverIds.firstNotNullOfOrNull { maneuverMap[it] } ?: ordered.firstOrNull()
+        currentGuidance = currentGuidance.copy(
+            currentManeuver = current,
+            upcomingManeuvers = ordered,
+            nextRoadName = current?.roadName ?: currentGuidance.nextRoadName,
+        )
+        onNavigationUpdate(currentGuidance)
+    }
+
+    // iAP2 ManeuverType values; unknown values fall back to UNKNOWN (rawType is kept for logging).
+    private fun mapRawManeuverType(raw: Int): CarPlayManeuverType = when (raw) {
+        0 -> CarPlayManeuverType.TURN_LEFT
+        1 -> CarPlayManeuverType.TURN_RIGHT
+        2 -> CarPlayManeuverType.STRAIGHT
+        3, 17 -> CarPlayManeuverType.U_TURN_LEFT
+        4 -> CarPlayManeuverType.CONTINUE
+        5 -> CarPlayManeuverType.ROUNDABOUT_ENTER
+        6 -> CarPlayManeuverType.ROUNDABOUT_EXIT
+        7 -> CarPlayManeuverType.OFF_RAMP
+        8 -> CarPlayManeuverType.ON_RAMP
+        9, 11, 18 -> CarPlayManeuverType.ARRIVED_AT_DESTINATION
+        12 -> CarPlayManeuverType.KEEP_LEFT
+        13 -> CarPlayManeuverType.KEEP_RIGHT
+        else -> CarPlayManeuverType.UNKNOWN
+    }
+
+    private companion object {
+        const val P_STATE = 1
+        const val P_CURRENT_ROAD = 3
+        const val P_DESTINATION = 4
+        const val P_TIME_REMAINING = 6
+        const val P_DISTANCE_REMAINING = 7
+        const val P_DISTANCE_TO_NEXT = 10
+        const val P_MANEUVER_LIST = 13
+
+        const val P_M_INDEX = 1
+        const val P_M_DESCRIPTION = 2
+        const val P_M_TYPE = 3
+        const val P_M_AFTER_ROAD = 4
+        const val P_M_DISTANCE = 5
+        const val P_M_EXIT_INFO = 13
+
+        const val STATE_NOT_ACTIVE = 0
+        const val STATE_ARRIVED = 2
+        const val STATE_REROUTING = 5
     }
 }

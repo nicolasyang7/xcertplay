@@ -261,6 +261,9 @@ data class Iap2DeviceTransportIdentifier(
 
 /** Typed codecs for power and subscription requests used during bring-up. */
 object Iap2ControlMessages {
+    /** Display/component id sent in StartRouteGuidanceUpdates; the phone echoes it back in 0x5201. */
+    private const val ROUTE_GUIDANCE_COMPONENT_ID = 1
+
     fun powerSourceUpdate(
         availableCurrentMilliAmps: Int,
         charging: Boolean? = null,
@@ -284,7 +287,9 @@ object Iap2ControlMessages {
                 listOf(0, 1, 2, 3, 7).forEach(::void)
             }
         },
-        Iap2Messages.build(Iap2Endpoints.START_ROUTE_GUIDANCE_UPDATES) {},
+        Iap2Messages.build(Iap2Endpoints.START_ROUTE_GUIDANCE_UPDATES) {
+            u16(0, ROUTE_GUIDANCE_COMPONENT_ID)
+        },
         Iap2Messages.build(Iap2Endpoints.START_POWER_UPDATES) {
             void(4)
             void(5)

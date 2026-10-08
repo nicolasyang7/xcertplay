@@ -18,19 +18,15 @@ class CarPlayNavigationTest {
         }
 
         // Build 0x5201 RouteGuidanceUpdate frame:
-        // Param 0: currentRoadName = "Tianfu Ave"
-        // Param 1: destinationName = "Chengdu South Railway Station"
-        // Param 2: totalDistanceRemaining = 15400 (meters)
-        // Param 3: totalTimeRemaining = 1500 (seconds)
-        // Param 4: distanceToNextManeuver = 350 (meters)
-        // Param 5: state = 1 (active)
+        // 1 state, 3 currentRoadName, 4 destinationName, 6 timeRemaining (ms),
+        // 7 distanceRemaining (m), 10 distanceRemainingToNextManeuver (m)
         val frame = Iap2Messages.buildRaw(0x5201) {
-            string(0, "Tianfu Ave")
-            string(1, "Chengdu South Railway Station")
-            u32(2, 15400L)
-            u32(3, 1500L)
-            u32(4, 350L)
-            u8(5, 1)
+            u8(1, 1)
+            string(3, "Tianfu Ave")
+            string(4, "Chengdu South Railway Station")
+            u64(6, 1_500_000L)
+            u32(7, 15400L)
+            u32(10, 350L)
         }
 
         val handled = decoder.onIncomingFrame(frame)
@@ -55,19 +51,14 @@ class CarPlayNavigationTest {
         }
 
         // Build 0x5202 RouteGuidanceManeuverUpdate frame:
-        // Param 0: maneuverIndex = 0
-        // Param 1: maneuverType = 3 (TURN_LEFT)
-        // Param 2: turnAngle = -90
-        // Param 3: instruction = "Turn left onto Yizhou Ave"
-        // Param 4: roadName = "Yizhou Ave"
-        // Param 5: distance = 200 (meters)
+        // 1 index, 2 description, 3 maneuverType (0 = left turn), 4 afterManeuverRoadName,
+        // 5 distanceBetweenManeuver (m)
         val frame = Iap2Messages.buildRaw(0x5202) {
-            u16(0, 0)
-            u16(1, 3)
-            i16(2, -90)
-            string(3, "Turn left onto Yizhou Ave")
+            u16(1, 0)
+            string(2, "Turn left onto Yizhou Ave")
+            u8(3, 0)
             string(4, "Yizhou Ave")
-            u32(5, 200L)
+            u16(5, 200)
         }
 
         val handled = decoder.onIncomingFrame(frame)
@@ -80,7 +71,7 @@ class CarPlayNavigationTest {
         assertNotNull(maneuver)
         assertEquals(CarPlayManeuverType.TURN_LEFT, maneuver!!.type)
         assertEquals("Yizhou Ave", update.nextRoadName)
-        assertEquals(200, update.distanceToNextManeuverMeters)
+        assertEquals(200, maneuver!!.distanceMeters)
     }
 
     @Test
@@ -92,7 +83,7 @@ class CarPlayNavigationTest {
 
         // Send active guidance first
         val activeFrame = Iap2Messages.buildRaw(0x5201) {
-            u8(5, 1) // active
+            u8(1, 1) // active
         }
         decoder.onIncomingFrame(activeFrame)
         assertTrue(lastUpdate?.isActive == true)
