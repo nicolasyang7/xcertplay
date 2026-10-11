@@ -2,6 +2,8 @@ package com.shilapi.xcertplay.media
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.AudioFormat as AndroidAudioFormat
 import android.media.AudioTimestamp
 import android.media.AudioTrack
@@ -10,6 +12,8 @@ import android.media.MediaCodecList
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import com.shilapi.xcertplay.airplay.AudioCodecKind
@@ -39,7 +43,12 @@ class AndroidMediaSink(
     private val microphoneGainPercent: Int = MicrophoneGain.DEFAULT_PERCENT,
     mediaMetricsMonitor: MediaMetricsMonitor? = null,
     onScreenStreamActiveChanged: ((Int, Boolean) -> Unit)? = null,
+    private val videoSizes: Map<Int, Pair<Int, Int>> = emptyMap(),
+    private val mediaTap: MediaTap? = null,
+    private val onClosed: () -> Unit = {},
+    private val audioFocus: AudioFocusSession? = null,
 ) : MediaSink {
+    private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
     private val defaultSurface = surface
     @Volatile private var screenStreamActiveChanged = onScreenStreamActiveChanged
     private val surfaces = ConcurrentHashMap<Int, Surface>()
@@ -48,16 +57,41 @@ class AndroidMediaSink(
     private val microphoneUplinks = ConcurrentHashMap<Int, MicrophoneUplink>()
     private val videoRecoveryHandlers = ConcurrentHashMap<Int, () -> Boolean>()
     private val pendingVideoCodec = ConcurrentHashMap<Int, VideoCodec>()
+    private val videoConfigs = ConcurrentHashMap<Int, Pair<VideoCodec, ByteArray>>()
+    private val previewLock = Any()
     @Volatile private var mediaMetricsMonitor = mediaMetricsMonitor
+
+    init {
+        audioFocus?.retain(this)
+    }
 
     fun setSurface(type: Int, surface: Surface) {
         surfaces[type] = surface
-        videoDecoders[type]?.setSurface(surface)
+        if (!forwarded(type)) {
+            videoDecoders[type]?.setSurface(surface)
+            return
+        }
+        // A forwarded stream has no local decoder until a preview appears; start at the last config.
+        synchronized(previewLock) {
+            val decoder = videoDecoders[type]
+            if (decoder != null) decoder.setSurface(surface)
+            else videoConfigs[type]?.let { (codec, data) -> videoDecoder(type).configure(codec, data) }
+        }
     }
 
     fun clearSurface(type: Int, surface: Surface) {
-        if (surfaces.remove(type, surface)) videoDecoders[type]?.setSurface(null)
+        if (!forwarded(type)) {
+            if (surfaces.remove(type, surface)) videoDecoders[type]?.setSurface(null)
+            return
+        }
+        // Holding frames for a future Surface would apply backpressure to the forwarded stream.
+        synchronized(previewLock) {
+            if (surfaces.remove(type, surface)) videoDecoders.remove(type)?.close()
+        }
     }
+
+    /** Asks the phone for a random access picture; false when the stream cannot be asked. */
+    fun requestKeyFrame(type: Int): Boolean = videoRecoveryHandlers[type]?.invoke() ?: false
 
     fun setScreenStreamActiveChangedListener(listener: ((Int, Boolean) -> Unit)?) {
         screenStreamActiveChanged = listener
@@ -80,22 +114,41 @@ class AndroidMediaSink(
 
     override fun onVideoConfig(type: Int, codecData: ByteArray) {
         val codec = pendingVideoCodec[type] ?: VideoCodec.H264
-        videoDecoder(type).configure(codec, codecData)
+        videoConfigs[type] = codec to codecData.copyOf()
+        if (!forwarded(type)) {
+            videoDecoder(type).configure(codec, codecData)
+            return
+        }
+        mediaTap?.onVideoConfig(type, codec, codecData.copyOf())
+        synchronized(previewLock) {
+            if (surfaces[type] != null) videoDecoder(type).configure(codec, codecData)
+        }
     }
 
     override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
         val arrivalUs = System.nanoTime() / 1_000L
-        videoDecoder(type).submit(naluBytes, arrivalUs)
+        if (!forwarded(type)) {
+            videoDecoder(type).submit(naluBytes, arrivalUs)
+            return
+        }
+        val accessUnit = MediaCodecSupport.toLengthPrefixed(naluBytes)
+        if (accessUnit.isNotEmpty()) mediaTap?.onVideoFrame(type, accessUnit, arrivalUs)
+        // Only a preview decoder created with a Surface may take frames; it never holds them.
+        videoDecoders[type]?.submit(naluBytes, arrivalUs)
     }
 
     override fun onScreenStreamActive(type: Int, active: Boolean) {
         if (!active) {
             videoDecoders.remove(type)?.close()
             pendingVideoCodec.remove(type)
+            videoConfigs.remove(type)
             videoRecoveryHandlers.remove(type)
         }
+        mediaTap?.onVideoActive(type, active)
         screenStreamActiveChanged?.invoke(type, active)
     }
+
+    private fun forwarded(type: Int) = mediaTap?.forwardsVideo(type) == true
 
     override fun onAudioStarted(type: Int, format: AudioFormat, firstSample: Int) {
         audioRenderer(type, format).start()
@@ -107,6 +160,7 @@ class AndroidMediaSink(
 
     override fun onAudioStopped(type: Int) {
         audioRenderers.remove(type)?.close()
+        mediaTap?.onAudioStopped(type)
     }
 
     override fun onMicrophoneStarted(type: Int, config: MicrophoneConfig) {
@@ -121,22 +175,26 @@ class AndroidMediaSink(
     }
 
     fun close() {
+        if (!closed.compareAndSet(false, true)) return
         videoDecoders.values.forEach(VideoDecoder::close)
         videoDecoders.clear()
         videoRecoveryHandlers.clear()
         pendingVideoCodec.clear()
+        videoConfigs.clear()
         audioRenderers.values.forEach(AudioRenderer::close)
         audioRenderers.clear()
         microphoneUplinks.values.forEach(MicrophoneUplink::close)
         microphoneUplinks.clear()
+        audioFocus?.release(this)
+        onClosed()
     }
 
     private fun videoDecoder(type: Int): VideoDecoder =
         videoDecoders.computeIfAbsent(type) {
             VideoDecoder(
                 surfaces[type] ?: defaultSurface,
-                videoWidth,
-                videoHeight,
+                videoSizes[type]?.first ?: videoWidth,
+                videoSizes[type]?.second ?: videoHeight,
                 preferSoftwareHevcDecoder,
                 mediaMetricsMonitor,
                 requestKeyFrame = { videoRecoveryHandlers[type]?.invoke() ?: false },
@@ -149,12 +207,84 @@ class AndroidMediaSink(
         if (existing?.format == format) return existing
         existing?.close()
         return AudioRenderer(
+            type,
             format,
             advancedAudioChannelMapping,
             mainMediaAudioBufferDurationMs,
             mediaMetricsMonitor,
+            mediaTap,
         ).also {
             audioRenderers[type] = it
+        }
+    }
+
+    companion object {
+        fun createAudioFocus(context: Context): AudioFocusSession = AudioFocusSession(
+            context.applicationContext.getSystemService(AudioManager::class.java),
+        )
+    }
+
+    /** Shared by the visible host and the background media pipeline. */
+    class AudioFocusSession internal constructor(private val manager: AudioManager) {
+        private val owners = mutableSetOf<Any>()
+        private var requested = false
+        private var hasFocus = false
+        private val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build(),
+            )
+            .setAcceptsDelayedFocusGain(true)
+            .setWillPauseWhenDucked(true)
+            .setOnAudioFocusChangeListener(::onFocusChanged, Handler(Looper.getMainLooper()))
+            .build()
+
+        @Synchronized
+        fun retain(owner: Any) {
+            owners.add(owner)
+        }
+
+        /** Called only when the user enters the host, never by arriving audio packets. */
+        @Synchronized
+        fun requestFromHost() {
+            if (owners.isEmpty() || hasFocus) return
+            val result = manager.requestAudioFocus(request)
+            requested = result != AudioManager.AUDIOFOCUS_REQUEST_FAILED
+            hasFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            Log.i(TAG, "audio focus request result=$result")
+        }
+
+        @Synchronized
+        fun release(owner: Any) {
+            owners.remove(owner)
+            if (owners.isNotEmpty()) return
+            manager.abandonAudioFocusRequest(request)
+            requested = false
+            hasFocus = false
+            Log.i(TAG, "audio focus released")
+        }
+
+        @Synchronized
+        private fun onFocusChanged(change: Int) {
+            if (owners.isEmpty() || !requested) return
+            when (change) {
+                AudioManager.AUDIOFOCUS_GAIN -> hasFocus = true
+                AudioManager.AUDIOFOCUS_LOSS -> {
+                    requested = false
+                    hasFocus = false
+                }
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK,
+                -> hasFocus = false
+            }
+            // Focus tracks ownership only; the phone's audio keeps flowing at its normal volume.
+            Log.i(TAG, "audio focus change=$change hasFocus=$hasFocus")
+        }
+
+        private companion object {
+            const val TAG = "xcertplay-usb"
         }
     }
 }
@@ -539,10 +669,12 @@ private fun MediaFormat.intOrNull(key: String): Int? =
 
 /** Decodes AAC-LC/Opus to PCM and plays it, or plays wired LPCM directly. */
 private class AudioRenderer(
+    private val stream: Int,
     val format: AudioFormat,
     private val advancedAudioChannelMapping: Boolean,
     private val mainMediaAudioBufferDurationMs: Int,
     mediaMetricsMonitor: MediaMetricsMonitor?,
+    private val mediaTap: MediaTap?,
 ) : Closeable {
     private data class AudioPacket(val rtp: ByteArray, val sample: Int)
 
@@ -898,6 +1030,10 @@ private class AudioRenderer(
     }
 
     private fun writePcm(data: ByteArray, offset: Int = 0, length: Int = data.size) {
+        if (mediaTap?.takesAudio() == true) {
+            forwardPcm(data, offset, length)
+            return
+        }
         val track = track ?: return
         if (!firstPcmLogged && length > 0) {
             firstPcmLogged = true
@@ -943,6 +1079,25 @@ private class AudioRenderer(
                 }
             }
         }
+    }
+
+    /** Remote playback silences the local track; returning to it starts over with prebuffering. */
+    private fun forwardPcm(data: ByteArray, offset: Int, length: Int) {
+        val tap = mediaTap ?: return
+        val track = track
+        if (track != null && (playbackStarted || prebufferBytes > 0)) {
+            try {
+                track.pause()
+                track.flush()
+            } catch (_: Exception) {
+                // Best effort.
+            }
+            playbackStarted = false
+            prebufferBytes = 0
+            fadeApplied = false
+            Log.i(TAG, "audio forwarded remotely type=${format.payloadType}")
+        }
+        tap.onAudioPcm(stream, format.sampleRate, if (format.channels >= 2) 2 else 1, data, offset, length)
     }
 
     private fun playbackHeadFrames(track: AudioTrack): Long {

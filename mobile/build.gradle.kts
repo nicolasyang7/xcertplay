@@ -13,9 +13,9 @@ android {
         applicationId = "com.shilapi.xcertplay"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1303
-        versionName = "1.3.3-lynk09"
-
+        versionCode = 1400
+        versionName = "1.4.0-lynk09"
+        testInstrumentationRunner = "com.shilapi.xcertplay.CarPlayMediaServiceLifecycleTest"
     }
 
     signingConfigs {

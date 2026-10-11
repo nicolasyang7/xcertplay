@@ -47,6 +47,7 @@ object AirPlayPersistence {
     private const val KEY_MANUAL_HOTSPOT_BAND = "manual_hotspot_band"
     private const val KEY_MANUAL_HOTSPOT_CHANNEL = "manual_hotspot_channel"
     private const val KEY_MANUAL_HOTSPOT_SECURITY = "manual_hotspot_security"
+    private const val KEY_VIDEO_FRAME_LOGS_ENABLED = "video_frame_logs_enabled"
     private const val KEY_DEBUG_LOGS_ENABLED = "debug_logs_enabled"
     private const val KEY_MEDIA_METRICS_ENABLED = "media_metrics_enabled"
     private const val KEY_AUDIO_PACKET_CAPTURE_ENABLED = "audio_packet_capture_enabled"
@@ -78,6 +79,37 @@ object AirPlayPersistence {
     const val DEFAULT_MODEL = "xcertplay"
     const val DEFAULT_OEM_LABEL = ""
     const val DEFAULT_MFI_I2C_PATH = "/dev/i2c-1"
+
+    fun loadWebDisplay(context: Context, type: Int): CarPlayWebDisplayConfig {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val prefix = "web_display_${type}_"
+        val fallback = CarPlayWebDisplayConfig(width = if (type == 111) 1920 else 1280)
+        return runCatching {
+            fallback.copy(
+                enabled = prefs.getBoolean(prefix + "enabled", false),
+                width = prefs.getInt(prefix + "width", fallback.width),
+                height = prefs.getInt(prefix + "height", fallback.height),
+                preview = prefs.getBoolean(prefix + "preview", true),
+            )
+        }.getOrDefault(fallback)
+    }
+
+    fun saveWebDisplay(context: Context, type: Int, config: CarPlayWebDisplayConfig) {
+        val prefix = "web_display_${type}_"
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(prefix + "enabled", config.enabled)
+            .putInt(prefix + "width", config.width).putInt(prefix + "height", config.height)
+            .putBoolean(prefix + "preview", config.preview).apply()
+    }
+
+    @Synchronized fun webDisplayKey(context: Context): String {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        return prefs.getString("web_display_key", null) ?: ByteArray(24).also {
+            java.security.SecureRandom().nextBytes(it)
+        }.joinToString("") { "%02x".format(it.toInt() and 255) }.also {
+            prefs.edit().putString("web_display_key", it).apply()
+        }
+    }
 
     fun loadDisplayScaleTenths(context: Context): Int {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -319,6 +351,16 @@ object AirPlayPersistence {
     fun saveDebugLogsEnabled(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(KEY_DEBUG_LOGS_ENABLED, enabled)
+            .apply()
+    }
+
+    fun loadVideoFrameLogsEnabled(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_VIDEO_FRAME_LOGS_ENABLED, false)
+
+    fun saveVideoFrameLogsEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_VIDEO_FRAME_LOGS_ENABLED, enabled)
             .apply()
     }
 
