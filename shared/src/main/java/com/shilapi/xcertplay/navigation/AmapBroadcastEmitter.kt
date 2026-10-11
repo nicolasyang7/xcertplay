@@ -83,14 +83,20 @@ class AmapBroadcastEmitter(
             putExtra("NEXT_ROAD_NAME", guidance.nextRoadName ?: guidance.currentManeuver?.roadName ?: "")
             putExtra("CUR_ROAD_NAME", guidance.currentRoadName ?: "")
 
-            // Total remaining route distance & time
+            // Total remaining route distance & time. NaviTool drops a 10001 packet whose remaining
+            // distance and time are both <= 0, so leave unknown values out instead of sending -1.
             val totalDis = guidance.totalRemainingDistanceMeters ?: -1
             val totalTime = guidance.totalRemainingTimeSeconds ?: -1
-            putExtra("ROUTE_REMAIN_DIS", totalDis)
-            putExtra("ROUTE_REMAIN_DIS_AUTO", if (totalDis >= 0) formatDistanceText(totalDis) else "")
-            putExtra("ROUTE_REMAIN_TIME", totalTime)
-            putExtra("ROUTE_REMAIN_TIME_AUTO", if (totalTime >= 0) formatTimeText(totalTime) else "")
-            putExtra("ROUTE_ALL_DIS", if (initialTotalDistanceMeters > 0) initialTotalDistanceMeters else totalDis)
+            if (totalDis > 0) {
+                putExtra("ROUTE_REMAIN_DIS", totalDis)
+                putExtra("ROUTE_REMAIN_DIS_AUTO", formatDistanceText(totalDis))
+            }
+            if (totalTime > 0) {
+                putExtra("ROUTE_REMAIN_TIME", totalTime)
+                putExtra("ROUTE_REMAIN_TIME_AUTO", formatTimeText(totalTime))
+            }
+            val allDis = if (initialTotalDistanceMeters > 0) initialTotalDistanceMeters else totalDis
+            if (allDis > 0) putExtra("ROUTE_ALL_DIS", allDis)
 
             // ETA
             if (totalTime > 0) {
