@@ -5073,6 +5073,7 @@ class CarPlayHostActivity : ComponentActivity() {
         val MENU_SEPARATOR = HandshakePanelView.SEPARATOR
         val MENU_BUTTON = HandshakePanelView.FILL_DARK
         val MENU_BUTTON_PRIMARY = HandshakePanelView.FILL
+        val MENU_BUTTON_TEXT = Color.rgb(8, 17, 11)
         val MENU_DANGER = HandshakePanelView.RED
         val MENU_DANGER_FILL = HandshakePanelView.withAlpha(HandshakePanelView.RED, 36)
         val MENU_RIPPLE = HandshakePanelView.withAlpha(HandshakePanelView.LABEL, 40)
