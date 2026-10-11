@@ -1,161 +1,113 @@
 package com.shilapi.xcertplay.navigation
 
-import com.shilapi.xcertplay.iap2.body.Iap2BodyReader
-import com.shilapi.xcertplay.iap2.catalog.Iap2Endpoint
 import com.shilapi.xcertplay.iap2.wire.Iap2Frame
 
-/**
- * Decodes iAP2 Route Guidance CSM frames (0x5201, 0x5202, 0x5204) into normalized [CarPlayNavigationUpdate].
- */
+/** DiPlay route-guidance profile; lane extensions await verified real samples. */
 class CarPlayRouteGuidanceDecoder(
+    private val nanoTime: () -> Long = System::nanoTime,
+    private val diagnostic: (String) -> Unit = { android.util.Log.i("CarPlay-HUD", "[CarPlay-HUD] $it") },
     private val onNavigationUpdate: (CarPlayNavigationUpdate) -> Unit = {},
 ) {
-    private var currentGuidance = CarPlayNavigationUpdate(isActive = false)
-    private val maneuverMap = mutableMapOf<Int, CarPlayManeuver>()
-    private var currentManeuverIds: List<Int> = emptyList()
+    private val route = CarPlayRouteState(nanoTime, diagnostic)
+    private var unverifiedLaneLogged = false
+    private var emittedActive = false
+    private var lastAction: Triple<Int, Int, Int>? = null
+    private var lastUnavailable: String? = null
 
-    /**
-     * Inspects an incoming iAP2 frame. If it is a route guidance message, decodes it and dispatches
-     * an updated [CarPlayNavigationUpdate].
-     *
-     * @return true if the frame was a recognized route guidance message.
-     */
+    @Synchronized
     fun onIncomingFrame(frame: Iap2Frame): Boolean {
-        return when (frame.messageId) {
-            0x5201 -> { // RouteGuidanceUpdate
-                decodeRouteGuidanceUpdate(frame)
-                true
+        if (frame.messageId == 0x5204) {
+            if (!unverifiedLaneLogged) {
+                diagnostic("Lane frame received bytes=${frame.payload.size}; ignored until verified")
+                unverifiedLaneLogged = true
             }
-            0x5202 -> { // RouteGuidanceManeuverUpdate
-                decodeRouteGuidanceManeuverUpdate(frame)
-                true
-            }
-            0x5204 -> { // LaneGuidanceInfoUpdate
-                decodeLaneGuidanceUpdate(frame)
-                true
-            }
-            0x5203 -> { // StopRouteGuidanceUpdates
-                resetNavigation()
-                true
-            }
-            else -> false
+            return true
         }
+        if (frame.messageId !in setOf(0x5201, 0x5202)) return false
+        val change = route.accept(frame.messageId, frame.payload)
+        if (change == CarPlayRouteChange.CLEAR) resetNavigation()
+        else if (change == CarPlayRouteChange.GUIDANCE) publishCurrent()
+        return true
     }
 
+    /** Called periodically to repeat real guidance and clear expired/empty routes. */
+    @Synchronized
+    fun tick() = publishCurrent()
+
+    @Synchronized
     fun resetNavigation() {
-        maneuverMap.clear()
-        currentManeuverIds = emptyList()
-        currentGuidance = CarPlayNavigationUpdate(isActive = false)
-        onNavigationUpdate(currentGuidance)
+        diagnostic("Navigation reset; previouslyEmitted=$emittedActive")
+        lastAction = null
+        lastUnavailable = null
+        unverifiedLaneLogged = false
+        route.clear()
+        if (emittedActive) {
+            emittedActive = false
+            onNavigationUpdate(CarPlayNavigationUpdate(isActive = false))
+        }
     }
 
-    // 0x5201 RouteGuidanceUpdate parameter ids (see docs/iap2-route-guidance-fields.md).
-    private fun decodeRouteGuidanceUpdate(frame: Iap2Frame) {
-        try {
-            val reader = Iap2BodyReader.of(frame)
-            val state = reader.optionalU8(P_STATE)
-            // 0 = not active, 2 = arrived; anything else keeps guidance running.
-            if (state == STATE_NOT_ACTIVE || state == STATE_ARRIVED) {
-                resetNavigation()
-                return
+    private fun publishCurrent() {
+        val apple = route.currentApple()
+        if (apple == null) {
+            val reason = route.unavailableReason()
+            if (reason != lastUnavailable) diagnostic("Navigation unavailable: $reason")
+            lastUnavailable = reason
+            lastAction = null
+            if (emittedActive) {
+                emittedActive = false
+                onNavigationUpdate(CarPlayNavigationUpdate(isActive = false))
             }
-            val currentRoad = reader.optionalString(P_CURRENT_ROAD)
-            val destination = reader.optionalString(P_DESTINATION)
-            val remainingMillis = reader.optionalU64(P_TIME_REMAINING)
-            val totalRemainDis = reader.optionalU32(P_DISTANCE_REMAINING)?.toInt()
-            val distToNextManeuver = reader.optionalU32(P_DISTANCE_TO_NEXT)?.toInt()
-            val maneuverList = reader.optionalU16List(P_MANEUVER_LIST)
-
-            if (maneuverList != null) currentManeuverIds = maneuverList
-
-            currentGuidance = currentGuidance.copy(
-                isActive = true,
-                isRerouting = state == STATE_REROUTING,
-                currentRoadName = currentRoad ?: currentGuidance.currentRoadName,
-                destinationName = destination ?: currentGuidance.destinationName,
-                totalRemainingDistanceMeters = totalRemainDis ?: currentGuidance.totalRemainingDistanceMeters,
-                totalRemainingTimeSeconds = remainingMillis?.let { (it / 1000L).toInt() }
-                    ?: currentGuidance.totalRemainingTimeSeconds,
-                distanceToNextManeuverMeters = distToNextManeuver ?: currentGuidance.distanceToNextManeuverMeters,
-            )
-            publishWithManeuvers()
-        } catch (e: Exception) {
-            // Guard against malformed TLV
+            return
         }
-    }
-
-    // 0x5202 RouteGuidanceManeuverUpdate parameter ids.
-    private fun decodeRouteGuidanceManeuverUpdate(frame: Iap2Frame) {
-        try {
-            val reader = Iap2BodyReader.of(frame)
-            val index = reader.optionalU16(P_M_INDEX) ?: return
-            val rawType = reader.optionalU8(P_M_TYPE) ?: 0
-            maneuverMap[index] = CarPlayManeuver(
-                index = index,
-                type = mapRawManeuverType(rawType),
-                rawType = rawType,
-                instruction = reader.optionalString(P_M_DESCRIPTION),
-                roadName = reader.optionalString(P_M_AFTER_ROAD),
-                distanceMeters = reader.optionalU16(P_M_DISTANCE),
-                exitNumber = reader.optionalString(P_M_EXIT_INFO),
-            )
-            currentGuidance = currentGuidance.copy(isActive = true)
-            publishWithManeuvers()
-        } catch (e: Exception) {
-            // Guard against malformed TLV
+        val frame = NaviToolGuidanceFrame.from(apple)
+        // NaviTool treats icon 0 as cruise. Never send an unknown turn as cruise/straight.
+        // Skip this update without ending the route or inventing a maneuver.
+        // Genuine route end, disconnect and expiry still clear the output.
+        lastUnavailable = null
+        val action = Triple(route.currentIndex(), apple.type, frame.icon)
+        if (action != lastAction) {
+            diagnostic("Maneuver advanced: index=${action.first}, rawType=${apple.type} -> " +
+                "amapIcon=${frame.icon}, road=${apple.road}, dist=${apple.distanceMeters}m" +
+                if (frame.icon == 0) "; unknown action suppressed" else "")
+            lastAction = action
         }
-    }
-
-    // 0x5204 LaneGuidanceInfoUpdate: the laneInfoList children are not documented, so lane data is
-    // not decoded rather than guessed.
-    private fun decodeLaneGuidanceUpdate(frame: Iap2Frame) = Unit
-
-    private fun publishWithManeuvers() {
-        val ordered = maneuverMap.values.sortedBy { it.index }
-        val current = currentManeuverIds.firstNotNullOfOrNull { maneuverMap[it] } ?: ordered.firstOrNull()
-        currentGuidance = currentGuidance.copy(
-            currentManeuver = current,
-            upcomingManeuvers = ordered,
-            nextRoadName = current?.roadName ?: currentGuidance.nextRoadName,
+        if (frame.icon == 0) return
+        emittedActive = true
+        val maneuver = CarPlayManeuver(
+            index = route.currentIndex(),
+            type = when (frame.icon) {
+                2 -> CarPlayManeuverType.TURN_LEFT
+                3 -> CarPlayManeuverType.TURN_RIGHT
+                4 -> CarPlayManeuverType.TURN_SLIGHT_LEFT
+                5 -> CarPlayManeuverType.TURN_SLIGHT_RIGHT
+                6 -> CarPlayManeuverType.TURN_SHARP_LEFT
+                7 -> CarPlayManeuverType.TURN_SHARP_RIGHT
+                8 -> CarPlayManeuverType.U_TURN_LEFT
+                9 -> CarPlayManeuverType.STRAIGHT
+                11 -> CarPlayManeuverType.ROUNDABOUT_ENTER
+                12 -> CarPlayManeuverType.ROUNDABOUT_EXIT
+                17 -> CarPlayManeuverType.KEEP_LEFT
+                18 -> CarPlayManeuverType.KEEP_RIGHT
+                15 -> CarPlayManeuverType.ARRIVED_AT_DESTINATION
+                19 -> CarPlayManeuverType.U_TURN_RIGHT
+                else -> CarPlayManeuverType.UNKNOWN
+            },
+            rawType = apple.type,
+            roadName = apple.road,
+            distanceMeters = apple.distanceMeters,
+            amapIcon = frame.icon,
+            exitNumber = frame.roundaboutExit.takeIf { it > 0 }?.toString(),
         )
-        onNavigationUpdate(currentGuidance)
-    }
-
-    // iAP2 ManeuverType values; unknown values fall back to UNKNOWN (rawType is kept for logging).
-    private fun mapRawManeuverType(raw: Int): CarPlayManeuverType = when (raw) {
-        0 -> CarPlayManeuverType.TURN_LEFT
-        1 -> CarPlayManeuverType.TURN_RIGHT
-        2 -> CarPlayManeuverType.STRAIGHT
-        3, 17 -> CarPlayManeuverType.U_TURN_LEFT
-        4 -> CarPlayManeuverType.CONTINUE
-        5 -> CarPlayManeuverType.ROUNDABOUT_ENTER
-        6 -> CarPlayManeuverType.ROUNDABOUT_EXIT
-        7 -> CarPlayManeuverType.OFF_RAMP
-        8 -> CarPlayManeuverType.ON_RAMP
-        9, 11, 18 -> CarPlayManeuverType.ARRIVED_AT_DESTINATION
-        12 -> CarPlayManeuverType.KEEP_LEFT
-        13 -> CarPlayManeuverType.KEEP_RIGHT
-        else -> CarPlayManeuverType.UNKNOWN
-    }
-
-    private companion object {
-        const val P_STATE = 1
-        const val P_CURRENT_ROAD = 3
-        const val P_DESTINATION = 4
-        const val P_TIME_REMAINING = 6
-        const val P_DISTANCE_REMAINING = 7
-        const val P_DISTANCE_TO_NEXT = 10
-        const val P_MANEUVER_LIST = 13
-
-        const val P_M_INDEX = 1
-        const val P_M_DESCRIPTION = 2
-        const val P_M_TYPE = 3
-        const val P_M_AFTER_ROAD = 4
-        const val P_M_DISTANCE = 5
-        const val P_M_EXIT_INFO = 13
-
-        const val STATE_NOT_ACTIVE = 0
-        const val STATE_ARRIVED = 2
-        const val STATE_REROUTING = 5
+        onNavigationUpdate(CarPlayNavigationUpdate(
+            isActive = true,
+            currentManeuver = maneuver,
+            upcomingManeuvers = listOf(maneuver),
+            distanceToNextManeuverMeters = frame.distanceMeters,
+            totalRemainingDistanceMeters = frame.routeRemainingMeters.takeIf { it >= 0 },
+            totalRemainingTimeSeconds = frame.routeRemainingSeconds.takeIf { it >= 0 },
+            currentRoadName = route.currentRoadName(),
+            nextRoadName = frame.road,
+        ))
     }
 }

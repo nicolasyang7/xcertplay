@@ -38,6 +38,7 @@ data class CarPlayManeuver(
     val index: Int = 0,
     val type: CarPlayManeuverType = CarPlayManeuverType.UNKNOWN,
     val rawType: Int = 0,
+    val amapIcon: Int? = null,
     val turnAngleDegrees: Float? = null,
     val instruction: String? = null,
     val roadName: String? = null,
@@ -53,6 +54,8 @@ data class LaneDirection(
 data class LaneGuidanceInfo(
     val lanes: List<LaneDirection> = emptyList(),
     val isHighlighted: Boolean = true,
+    // Set only after real iPhone lane samples and NaviTool icon semantics are verified.
+    val verifiedFromIphone: Boolean = false,
 )
 
 data class CarPlayNavigationUpdate(

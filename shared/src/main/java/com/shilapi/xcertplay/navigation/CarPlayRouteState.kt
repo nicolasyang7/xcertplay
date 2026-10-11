@@ -1,0 +1,217 @@
+// Adapted from DiPlay 18429e7 (GPL-3.0); preserve upstream notices.
+package com.shilapi.xcertplay.navigation
+
+internal data class CarPlayAppleManeuver(
+    val distanceMeters: Int,
+    val type: Int,
+    val drivingSide: Int,
+    val road: String = "",
+    val remainingSeconds: Long? = null,
+    val remainingMeters: Long? = null,
+    val arrivalEpochSeconds: Long? = null,
+)
+
+internal enum class CarPlayRouteChange {
+    NONE,
+    GUIDANCE,
+    CLEAR,
+}
+
+/** Decodes the iAP2 route-guidance subset used by the CarPlay to NaviTool bridge. */
+internal class CarPlayRouteState(private val nanoTime: () -> Long = System::nanoTime,
+    private val diagnostic: (String) -> Unit = {},
+) {
+    private data class Maneuver(val type: Int, val drivingSide: Int, val afterRoad: String)
+
+    private val maneuvers = mutableMapOf<Int, Maneuver>()
+    private var routeActive = false
+    private var lastProtocolState: Int? = null
+    private var activeIndex = -1
+    private var distanceMeters = 0
+    private var currentRoad = ""
+    private var arrivalEpochSeconds: Long? = null
+    private var remainingSeconds: Long? = null
+    private var remainingMeters: Long? = null
+    private var emptyListSinceNs: Long? = null
+    private var lastRouteUpdateNs: Long? = null
+
+    fun accept(messageId: Int, payload: ByteArray): CarPlayRouteChange {
+        if (!validTlvs(payload)) {
+            diagnostic("Malformed TLV: message=0x${messageId.toString(16)} bytes=${payload.size}")
+            return CarPlayRouteChange.NONE
+        }
+        return when (messageId) {
+            ROUTE_GUIDANCE_UPDATE -> parseRouteUpdate(payload)
+            ROUTE_GUIDANCE_MANEUVER_UPDATE -> parseManeuverUpdate(payload)
+            else -> CarPlayRouteChange.NONE
+        }
+    }
+
+    /** Next maneuver as Apple sent it, for outputs with a richer icon set than the HUD. */
+    fun currentApple(): CarPlayAppleManeuver? {
+        val maneuver = activeManeuver() ?: return null
+        return CarPlayAppleManeuver(
+            distanceMeters, maneuver.type, maneuver.drivingSide,
+            roadFor(maneuver), remainingSeconds, remainingMeters, arrivalEpochSeconds,
+        )
+    }
+
+    fun currentRoadName(): String = currentRoad
+    fun currentIndex(): Int = activeIndex
+    fun unavailableReason(): String = when {
+        !routeActive -> "no active route"
+        lastRouteUpdateNs?.let { nanoTime() - it >= STALE_ROUTE_NS } == true -> "route timeout (30s)"
+        emptyListSinceNs?.let { nanoTime() - it >= EMPTY_LIST_HIDE_NS } == true -> "empty maneuver list timeout (3s)"
+        activeIndex < 0 -> "awaiting maneuver index"
+        maneuvers[activeIndex] == null -> "awaiting maneuver details index=$activeIndex"
+        else -> "available"
+    }
+
+    fun clear(): Boolean {
+        val wasActive = routeActive
+        routeActive = false
+        lastProtocolState = null
+        activeIndex = -1
+        distanceMeters = 0
+        currentRoad = ""
+        arrivalEpochSeconds = null
+        remainingSeconds = null
+        remainingMeters = null
+        emptyListSinceNs = null
+        lastRouteUpdateNs = null
+        maneuvers.clear()
+        return wasActive
+    }
+
+    private fun activeManeuver(): Maneuver? {
+        if (!routeActive || activeIndex < 0) return null
+        val updated = lastRouteUpdateNs ?: return null
+        if (nanoTime() - updated >= STALE_ROUTE_NS) return null
+        val emptySince = emptyListSinceNs
+        if (emptySince != null && nanoTime() - emptySince >= EMPTY_LIST_HIDE_NS) return null
+        return maneuvers[activeIndex]
+    }
+
+    // The road the driver turns onto is what the next instruction is about; fall back to the current one.
+    private fun roadFor(maneuver: Maneuver): String = maneuver.afterRoad.ifEmpty { currentRoad }
+
+    private fun parseRouteUpdate(data: ByteArray): CarPlayRouteChange {
+        lastRouteUpdateNs = nanoTime()
+        var state: Int? = null
+        var distance: Int? = null
+        var firstManeuver: Int? = null
+        var listPresent = false
+        forEachTlv(data) { type, value, valueLength ->
+            when {
+                type == 0x01 && valueLength >= 1 -> state = data[value].toInt() and 0xff
+                type == 0x03 -> currentRoad = utf8(data, value, valueLength)
+                type == 0x05 && valueLength >= 8 -> arrivalEpochSeconds = u64(data, value).takeIf { it > 0 }
+                type == 0x06 && valueLength >= 8 -> remainingSeconds = u64(data, value).takeIf { it >= 0 }
+                type == 0x07 && valueLength >= 4 -> remainingMeters = u32(data, value)
+                type == 0x0a && valueLength >= 4 -> {
+                    distance = u32(data, value).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                }
+                type == 0x0d -> {
+                    listPresent = true
+                    if (valueLength >= 2) firstManeuver = u16(data, value)
+                }
+            }
+        }
+
+        if (state != null && state != lastProtocolState) {
+            diagnostic("Route state changed: $lastProtocolState -> $state (only 0 is a verified end)")
+            lastProtocolState = state
+        }
+        // State 2 is unverified for this vehicle/profile; do not infer arrival.
+        // Only explicit NoRouteSet (0) ends the route until real frames confirm other states.
+        if (state == 0) {
+            diagnostic("Explicit NoRouteSet; clearing navigation")
+            return if (clear()) CarPlayRouteChange.CLEAR else CarPlayRouteChange.NONE
+        }
+        // The iPhone briefly sends an empty current list every few seconds and while rerouting. Keep the last
+        // maneuver (and the cached 0x5202 details, which are never resent) and hide it only if the list stays
+        // empty; the bridges' 1 s tick clears the outputs once currentApple() turns null.
+        if (listPresent && firstManeuver == null) {
+            if (emptyListSinceNs == null) {
+                emptyListSinceNs = nanoTime()
+                diagnostic("Empty maneuver list; retaining current instruction for up to 3s (reroute not inferred)")
+            }
+            return CarPlayRouteChange.NONE
+        }
+        if (firstManeuver != null) {
+            if (emptyListSinceNs != null) diagnostic("Maneuver list recovered")
+            emptyListSinceNs = null
+        }
+        if (state != null) routeActive = true
+        if (firstManeuver != null) {
+            activeIndex = firstManeuver!!
+            routeActive = true
+        }
+        if (distance != null) distanceMeters = distance!!.coerceAtLeast(0)
+        return if (currentApple() != null) CarPlayRouteChange.GUIDANCE else CarPlayRouteChange.NONE
+    }
+
+    private fun parseManeuverUpdate(data: ByteArray): CarPlayRouteChange {
+        var index: Int? = null
+        var type: Int? = null
+        var drivingSide = 0
+        var afterRoad = ""
+        forEachTlv(data) { id, value, valueLength ->
+            when {
+                id == 0x01 && valueLength >= 2 -> index = u16(data, value)
+                id == 0x03 && valueLength >= 1 -> type = data[value].toInt() and 0xff
+                id == 0x04 -> afterRoad = utf8(data, value, valueLength)
+                id == 0x08 && valueLength >= 1 -> drivingSide = data[value].toInt() and 0xff
+            }
+        }
+        if (index != null && type != null) maneuvers[index!!] = Maneuver(type!!, drivingSide, afterRoad)
+        else diagnostic("Incomplete maneuver ignored: index=$index rawType=$type")
+        return if (currentApple() != null) CarPlayRouteChange.GUIDANCE else CarPlayRouteChange.NONE
+    }
+
+    private inline fun forEachTlv(data: ByteArray, block: (Int, Int, Int) -> Unit) {
+        var offset = 0
+        while (offset < data.size) {
+            val length = u16(data, offset)
+            block(u16(data, offset + 2), offset + TLV_HEADER_BYTES, length - TLV_HEADER_BYTES)
+            offset += length
+        }
+    }
+
+    private fun validTlvs(data: ByteArray): Boolean {
+        var offset = 0
+        while (offset < data.size) {
+            if (offset + TLV_HEADER_BYTES > data.size) return false
+            val length = u16(data, offset)
+            if (length < TLV_HEADER_BYTES || length > data.size - offset) return false
+            offset += length
+        }
+        return offset == data.size
+    }
+
+    private fun u16(data: ByteArray, offset: Int): Int =
+        ((data[offset].toInt() and 0xff) shl 8) or (data[offset + 1].toInt() and 0xff)
+
+    private fun u32(data: ByteArray, offset: Int): Long =
+        ((data[offset].toLong() and 0xff) shl 24) or
+            ((data[offset + 1].toLong() and 0xff) shl 16) or
+            ((data[offset + 2].toLong() and 0xff) shl 8) or
+            (data[offset + 3].toLong() and 0xff)
+
+    private fun u64(data: ByteArray, offset: Int): Long = (u32(data, offset) shl 32) or u32(data, offset + 4)
+
+    // iAP2 utf8 parameters are NUL-terminated.
+    private fun utf8(data: ByteArray, offset: Int, length: Int): String {
+        var end = offset
+        while (end < offset + length && data[end] != 0.toByte()) end++
+        return String(data, offset, end - offset, Charsets.UTF_8).trim()
+    }
+
+    companion object {
+        const val ROUTE_GUIDANCE_UPDATE = 0x5201
+        const val ROUTE_GUIDANCE_MANEUVER_UPDATE = 0x5202
+        private const val TLV_HEADER_BYTES = 4
+        private const val STALE_ROUTE_NS = 30_000_000_000L
+        private const val EMPTY_LIST_HIDE_NS = 3_000_000_000L
+    }
+}

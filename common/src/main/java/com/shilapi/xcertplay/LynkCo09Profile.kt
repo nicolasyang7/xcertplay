@@ -17,7 +17,7 @@ internal object LynkCo09Profile {
 
     fun hotspotModeFor(apiLevel: Int): WirelessHotspotMode =
         if (apiLevel < Build.VERSION_CODES.Q) {
-            WirelessHotspotMode.LOCAL_ONLY_HOTSPOT
+            WirelessHotspotMode.MANUAL
         } else {
             WirelessHotspotMode.WIFI_P2P
         }

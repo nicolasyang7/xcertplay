@@ -535,7 +535,7 @@ class CarPlayHostActivity : ComponentActivity() {
         locationPermissionAvailable = hasFineLocationPermission()
         setContentView(buildContentView())
         applyFullscreenMode()
-        startVisionSampling()
+        // startVisionSampling() disabled: TextureView.getBitmap() every 500ms stalls the GPU pipeline and causes frame drops.
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {

@@ -445,6 +445,7 @@ private class VideoDecoder(
             if (parameters.colorRange != -1) setInteger(MediaFormat.KEY_COLOR_RANGE, parameters.colorRange)
             if (parameters.colorTransfer != -1) setInteger(MediaFormat.KEY_COLOR_TRANSFER, parameters.colorTransfer)
             setInteger(MediaFormat.KEY_PRIORITY, 0)
+            setInteger(MediaFormat.KEY_OPERATING_RATE, 60)
         }
         val next = createDecoder(mime)
         try {
@@ -452,6 +453,13 @@ private class VideoDecoder(
                 next.codecInfo.getCapabilitiesForType(mime)
                     .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
             ) format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+
+            val codecName = next.name
+            if (codecName.startsWith("c2.qti.") || codecName.startsWith("OMX.qcom.")) {
+                format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+                format.setInteger("vendor.qti-ext-dec-picture-order.enable", 1)
+            }
+
             next.configure(format, surface, null, 0)
             next.start()
         } catch (error: Exception) {

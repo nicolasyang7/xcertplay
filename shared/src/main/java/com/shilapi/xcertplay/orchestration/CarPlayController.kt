@@ -191,9 +191,11 @@ class CarPlayController(
     private var mfiResetLogged = false
 
     val amapBroadcastEmitter = AmapBroadcastEmitter(appContext)
-    val routeGuidanceDecoder = CarPlayRouteGuidanceDecoder { update ->
-        amapBroadcastEmitter.emitNavigationUpdate(update)
-    }
+    val routeGuidanceDecoder = CarPlayRouteGuidanceDecoder(
+        onNavigationUpdate = { update ->
+            amapBroadcastEmitter.emitNavigationUpdate(update)
+        },
+    )
 
     @Volatile private var closed = false
     @Volatile private var phase = Phase.IDLE
@@ -250,6 +252,8 @@ class CarPlayController(
 
         override fun onSessionEnded(session: AirPlaySession) {
             if (activeSession === session) activeSession = null
+            routeGuidanceDecoder.resetNavigation()
+            amapBroadcastEmitter.emitNavigationEnded()
             debugLog("AirPlay session ended peer=<redacted>")
             uiListener?.onSessionEnded(session)
         }
