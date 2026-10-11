@@ -189,9 +189,11 @@ class CarPlayController(
     private var reenumerationAttempts = 0
     private var lastReportedStatus: CarPlayStatus? = null
     private var mfiResetLogged = false
+    private var navFramesSeen = 0
 
-    val amapBroadcastEmitter = AmapBroadcastEmitter(appContext)
+    val amapBroadcastEmitter = AmapBroadcastEmitter(appContext, onLog = ::debugLog)
     val routeGuidanceDecoder = CarPlayRouteGuidanceDecoder(
+        diagnostic = { debugLog("EVENT nav/decoder $it") },
         onNavigationUpdate = { update ->
             amapBroadcastEmitter.emitNavigationUpdate(update)
         },
@@ -361,6 +363,12 @@ class CarPlayController(
     }
 
     private fun onIap2Incoming(frame: Iap2Frame) {
+        if (frame.messageId in 0x5201..0x5204) {
+            navFramesSeen++
+            if (navFramesSeen <= 10 || navFramesSeen % 50 == 0) {
+                debugLog("EVENT nav/iap2_rx id=0x${frame.messageId.toString(16)} n=$navFramesSeen bytes=${frame.payload.size}")
+            }
+        }
         routeGuidanceDecoder.onIncomingFrame(frame)
         if (frame.messageId != NOW_PLAYING_UPDATE) return
         try {

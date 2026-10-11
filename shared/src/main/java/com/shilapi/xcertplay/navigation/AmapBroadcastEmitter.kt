@@ -17,6 +17,7 @@ class AmapBroadcastEmitter(
     private val targetPackage: String? = null,
     // Modified AMap external bridge requires this marker on the global action.
     private val factoryHudBridge: Boolean = false,
+    private val onLog: (String) -> Unit = {},
 ) {
     companion object {
         const val ORIGIN_SOURCE = "xcertplay_carplay"
@@ -40,6 +41,7 @@ class AmapBroadcastEmitter(
 
     private var initialTotalDistanceMeters: Int = 0
     @Volatile private var navigationSent = false
+    private var sentCount = 0
 
     /**
      * Emits P0 turn-by-turn guidance and route overview (KEY_TYPE = 10001).
@@ -52,7 +54,11 @@ class AmapBroadcastEmitter(
         }
 
         val iconCode = mapManeuverToAmapIcon(guidance.currentManeuver)
-        if (iconCode == 0) return
+        if (iconCode == 0) {
+            val m = guidance.currentManeuver
+            onLog("EVENT nav/amap_skip reason=no_icon maneuver=${m?.type} raw=${m?.rawType}")
+            return
+        }
         if (initialTotalDistanceMeters == 0 && (guidance.totalRemainingDistanceMeters ?: 0) > 0) {
             initialTotalDistanceMeters = guidance.totalRemainingDistanceMeters!!
         }
@@ -183,6 +189,15 @@ class AmapBroadcastEmitter(
     private fun send(intent: Intent) {
         intent.putExtra("ORIGIN_SOURCE", ORIGIN_SOURCE)
         context.sendBroadcast(intent)
+        sentCount++
+        if (sentCount <= 10 || sentCount % 50 == 0) {
+            onLog(
+                "EVENT nav/amap_tx n=$sentCount key_type=${intent.getIntExtra("KEY_TYPE", -1)} " +
+                    "action=${intent.action} package=${intent.`package`} icon=${intent.getIntExtra("NEW_ICON", -1)} " +
+                    "seg=${intent.getIntExtra("SEG_REMAIN_DIS", -1)} remain=${intent.getIntExtra("ROUTE_REMAIN_DIS", -1)} " +
+                    "state=${intent.getIntExtra("EXTRA_STATE", -1)}",
+            )
+        }
         Log.i(TAG, "[CarPlay-HUD-TX] ${intent.getIntExtra("KEY_TYPE", -1)} sent: " +
             "source=$ORIGIN_SOURCE icon=${intent.getIntExtra("NEW_ICON", -1)} " +
             "remainDist=${intent.getIntExtra("ROUTE_REMAIN_DIS", -1)} " +
