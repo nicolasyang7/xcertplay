@@ -11,7 +11,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal const val MICROPHONE_CAPTURE_RATE_HZ = 16_000
 
-internal fun openMicrophoneRecorder(requestedBufferBytes: Int): AudioRecord {
+internal fun openMicrophoneRecorder(
+    requestedBufferBytes: Int,
+    audioSource: Int = MediaRecorder.AudioSource.MIC,
+): AudioRecord {
     val minBuffer = AudioRecord.getMinBufferSize(
         MICROPHONE_CAPTURE_RATE_HZ,
         AndroidAudioFormat.CHANNEL_IN_MONO,
@@ -19,7 +22,7 @@ internal fun openMicrophoneRecorder(requestedBufferBytes: Int): AudioRecord {
     )
     check(minBuffer > 0) { "microphone unavailable at $MICROPHONE_CAPTURE_RATE_HZ Hz" }
     val recorder = AudioRecord.Builder()
-        .setAudioSource(MediaRecorder.AudioSource.MIC)
+        .setAudioSource(audioSource)
         .setAudioFormat(
             AndroidAudioFormat.Builder()
                 .setEncoding(AndroidAudioFormat.ENCODING_PCM_16BIT)

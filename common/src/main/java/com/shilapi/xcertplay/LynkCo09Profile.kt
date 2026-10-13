@@ -15,6 +15,8 @@ internal object LynkCo09Profile {
 
     val mfiTarget: MfiTarget = MfiTarget.USB_CH341
 
+    const val AUDIO_FOCUS_ENABLED = false
+
     fun hotspotModeFor(apiLevel: Int): WirelessHotspotMode =
         if (apiLevel < Build.VERSION_CODES.Q) {
             WirelessHotspotMode.MANUAL

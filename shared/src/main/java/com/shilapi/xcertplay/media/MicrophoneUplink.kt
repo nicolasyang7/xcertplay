@@ -2,7 +2,9 @@ package com.shilapi.xcertplay.media
 
 import android.content.Context
 import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.util.Log
+import com.shilapi.xcertplay.network.GeelyHeadUnit
 import com.shilapi.xcertplay.airplay.AudioCodecKind
 import com.shilapi.xcertplay.airplay.MicrophoneConfig
 import com.shilapi.xcertplay.airplay.MicrophoneCounters
@@ -57,9 +59,19 @@ internal class MicrophoneUplink(
             )
         }
 
+        val audioSource = when {
+            config.audioType == "telephony" -> MediaRecorder.AudioSource.VOICE_COMMUNICATION
+            config.audioType == "speechrecognition" ->
+                if (GeelyHeadUnit.detected) {
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                } else {
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION
+                }
+            else -> MediaRecorder.AudioSource.MIC
+        }
         val captureFrameBytes =
             MICROPHONE_CAPTURE_RATE_HZ * config.frameMillis / 1000 * BYTES_PER_SAMPLE
-        val nextRecorder = openMicrophoneRecorder(captureFrameBytes * 4)
+        val nextRecorder = openMicrophoneRecorder(captureFrameBytes * 4, audioSource)
         recorder = nextRecorder
 
         val nextSocket = DatagramSocket(null).apply {

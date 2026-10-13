@@ -40,6 +40,17 @@
 - 未验证 (需上车): 去掉后 iPhone 是否把通话路由回蓝牙 HFP;Siri 是否仍可用;会话是否仍能正常建立。
 - 做成设置开关 (默认关闭电话) 比直接删除更稳妥,便于回退。
 
+## 1d. CarPlay 音乐与车机媒体冲突 / 方控按键与麦克风 (已于 2026-10-13 实施)
+
+- **问题根源**：上游 1.4.0 (`a6bd9ef`) 在 `CarPlayHostActivity.onResume()` 中无条件强制调用 `requestFromHost()` 抢占永久音频焦点 (`AUDIOFOCUS_GAIN`)，导致车机系统判定原车媒体（收音机、QQ 音乐等）失焦而直接切断/暂停。
+- **实施方案**：
+  1. `AirPlayPersistence` 与 `LynkCo09Profile` 增加 `KEY_AUDIO_FOCUS_ENABLED`（默认 `false`）及 `KEY_CAR_BLUETOOTH_AUDIO`（默认 `false`）。
+  2. `CarPlayHostActivity` 仅在用户手动开启 "Vehicle audio focus" 时才申请焦点并介入 MediaSink 音频焦点监听；默认不抢焦点，彻底恢复 1.3.3 的共存行为。
+  3. UI 设置界面增加“车机音频焦点”与“车载蓝牙音频”独立开关。
+  4. 集成吉利/领克 OneOS 原厂方向盘方控 AIDL (`IInputManager` / `IInputListener`)，支持切歌 (上一曲/下一曲)、播放/暂停，以及语音键长按唤醒 Siri。
+  5. 领克 09 麦克风录音音源针对语音识别定向为 `MediaRecorder.AudioSource.VOICE_COMMUNICATION`，打通主驾降噪采音通路。
+
+
 ## 2. 评估后暂不修改
 
 - issue #36 的"CarPlay 音乐播放约 1 秒后暂停"(车机蓝牙音乐抢占): 用户不使用媒体功能,忽略。

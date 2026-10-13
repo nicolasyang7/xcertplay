@@ -450,6 +450,24 @@ class CarPlayController(
         }
     }
 
+    fun sendMediaKey(index: Int): Boolean {
+        if (closed) return false
+        val session = activeSession ?: return false
+        return runCatching {
+            session.sendMedia(index)
+            true
+        }.getOrDefault(false)
+    }
+
+    fun requestSiri(): Boolean {
+        if (closed) return false
+        val session = activeSession ?: return false
+        return runCatching {
+            session.invokeSiri()
+            true
+        }.getOrDefault(false)
+    }
+
     override fun close() {
         synchronized(this) {
             if (closed) return

@@ -381,6 +381,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private var hevcSoftwareDecoderEnabled = false
     private var advancedAudioChannelMappingSupported = false
     private var advancedAudioChannelMapping = false
+    private var audioFocusEnabled = false
+    private var carBluetoothAudio = false
     private var mainMediaAudioBufferDurationMs = MainMediaAudioBuffer.DEFAULT_DURATION_MS
     @Volatile private var debugLogsEnabled = false
     private var videoFrameLogsEnabled = false
@@ -579,6 +581,8 @@ class CarPlayHostActivity : ComponentActivity() {
         advancedAudioChannelMapping =
             advancedAudioChannelMappingSupported &&
                 AirPlayPersistence.loadAdvancedAudioChannelMapping(this)
+        audioFocusEnabled = AirPlayPersistence.loadAudioFocusEnabled(this)
+        carBluetoothAudio = AirPlayPersistence.loadCarBluetoothAudio(this)
         mainMediaAudioBufferDurationMs =
             AirPlayPersistence.loadMainMediaAudioBufferDurationMs(this)
         microphoneGainPercent = AirPlayPersistence.loadMicrophoneGainPercent(this)
@@ -738,9 +742,11 @@ class CarPlayHostActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        CarPlayBackgroundSession.audioFocus(this).apply {
-            retain(this@CarPlayHostActivity)
-            requestFromHost()
+        if (audioFocusEnabled) {
+            CarPlayBackgroundSession.audioFocus(this).apply {
+                retain(this@CarPlayHostActivity)
+                requestFromHost()
+            }
         }
         locationPermissionAvailable = hasFineLocationPermission()
         if (locationReportingEnabled && !locationPermissionAvailable && !menuOpen) {
@@ -778,7 +784,10 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        CarPlayBackgroundSession.audioFocus(this).release(this)
+        if (audioFocusEnabled) {
+            CarPlayBackgroundSession.audioFocus(this).release(this)
+        }
+        GeelyWheelKeys.stop()
         stopMicrophoneGainTest()
         mainHandler.removeCallbacks(applyDisplaySize)
         clusterPreviewSurface?.let { detachSurface(SCREEN_TYPE_ALT, it); it.release() }
@@ -1204,6 +1213,40 @@ class CarPlayHostActivity : ComponentActivity() {
                 ).apply { topMargin = dp(20) },
             )
         }
+
+        content.addView(
+            settingsSwitchRow(
+                label = "Vehicle audio focus",
+                checked = audioFocusEnabled,
+                description = "Manage Android audio focus. Keep OFF on Lynk & Co to keep car radio/media playing without conflict",
+            ) { checked ->
+                audioFocusEnabled = checked
+                appendLog(
+                    "Vehicle audio focus ${if (checked) "enabled" else "disabled"}; applies when settings close",
+                )
+            },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(20) },
+        )
+
+        content.addView(
+            settingsSwitchRow(
+                label = "Car Bluetooth audio",
+                checked = carBluetoothAudio,
+                description = "Forward steering wheel media keys to vehicle Bluetooth AVRCP instead of iAP2 to avoid double track skipping",
+            ) { checked ->
+                carBluetoothAudio = checked
+                appendLog(
+                    "Car Bluetooth audio ${if (checked) "enabled" else "disabled"}; applies when settings close",
+                )
+            },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(20) },
+        )
 
         content.addView(
             settingsCategoryHeader("Identity & appearance"),
@@ -1706,6 +1749,7 @@ class CarPlayHostActivity : ComponentActivity() {
         manufacturer = LynkCo09Profile.MANUFACTURER
         model = LynkCo09Profile.MODEL
         oemLabel = LynkCo09Profile.OEM_LABEL
+        audioFocusEnabled = LynkCo09Profile.AUDIO_FOCUS_ENABLED
         wirelessPermissionsReady = hasRequiredWirelessPermissions()
         hotspotStatus = HotspotStatus(state = "stopped")
         wirelessTransportSwitch?.isChecked = true
@@ -1761,6 +1805,8 @@ class CarPlayHostActivity : ComponentActivity() {
         AirPlayPersistence.saveLocationReportingEnabled(this, locationReportingEnabled)
         AirPlayPersistence.saveAutoStartOnBoot(this, autoStartOnBoot)
         AirPlayPersistence.saveAdvancedAudioChannelMapping(this, advancedAudioChannelMapping)
+        AirPlayPersistence.saveAudioFocusEnabled(this, audioFocusEnabled)
+        AirPlayPersistence.saveCarBluetoothAudio(this, carBluetoothAudio)
         AirPlayPersistence.saveMainMediaAudioBufferDurationMs(
             this,
             mainMediaAudioBufferDurationMs,
@@ -4125,7 +4171,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 mediaMetricsMonitor = mediaMetricsMonitor,
                 onClosed = { outputs?.close() },
                 mediaTap = outputs,
-                audioFocus = CarPlayBackgroundSession.audioFocus(this),
+                audioFocus = if (audioFocusEnabled) CarPlayBackgroundSession.audioFocus(this) else null,
                 onScreenStreamActiveChanged = { type, active ->
                     onScreenStreamStateChanged(controllerGeneration, type, active)
                 },
@@ -4263,6 +4309,7 @@ class CarPlayHostActivity : ComponentActivity() {
             },
         )
         updateDebugOverlays()
+        GeelyWheelKeys.start(this)
         return true
     }
 
@@ -4362,6 +4409,7 @@ class CarPlayHostActivity : ComponentActivity() {
             checkNotNull(handshakeTimeline), activeScreenStreamTypes,
         )
         next.start()
+        GeelyWheelKeys.start(this)
     }
 
     private fun syncAirPlayDarkMode() {
@@ -4511,6 +4559,7 @@ class CarPlayHostActivity : ComponentActivity() {
         val generation = ++restartGeneration
         val oldController = controller
         val oldSink = sink
+        GeelyWheelKeys.stop()
         CarPlayBackgroundSession.clear(oldController)
         controller = null
         sink = null
@@ -4537,6 +4586,7 @@ class CarPlayHostActivity : ComponentActivity() {
         controller?.sendTouch(emptyList())
         val oldController = controller
         val oldSink = sink
+        GeelyWheelKeys.stop()
         CarPlayBackgroundSession.clear(oldController)
         controller = null
         sink = null
@@ -5096,7 +5146,7 @@ class CarPlayHostActivity : ComponentActivity() {
 }
 
 /** Process-local hand-off for keeping the CarPlay session alive while no Activity is visible. */
-private object CarPlayBackgroundSession {
+internal object CarPlayBackgroundSession {
     val log = SessionLog()
     private var audioFocusSession: AndroidMediaSink.AudioFocusSession? = null
 
