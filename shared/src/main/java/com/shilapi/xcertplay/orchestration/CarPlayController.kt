@@ -25,6 +25,7 @@ import com.shilapi.xcertplay.navigation.CarPlayRouteGuidanceDecoder
 import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayContact
 import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
+import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
 import com.shilapi.xcertplay.airplay.AirPlayIdentity
 import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
 import com.shilapi.xcertplay.airplay.AirPlaySession
@@ -152,6 +153,7 @@ class CarPlayController(
     private val savePairRecord: (LockdownPairRecord) -> Unit = {},
     private val clearPairRecord: () -> Unit = {},
     private val locationProvider: Iap2LocationProvider? = null,
+    private val vehicleStatusProvider: com.shilapi.xcertplay.transport.VehicleStatusProvider? = null,
 ) : Closeable {
     init {
         require(!config.locationReportingEnabled || locationProvider != null) {
@@ -206,6 +208,10 @@ class CarPlayController(
     @Volatile private var mux: Iap2UsbMuxHost? = null
     @Volatile private var csm: Iap2Session? = null
     @Volatile private var activeSession: AirPlaySession? = null
+    /** Survives AirPlay reconnects so a new session is moved to the area the host is showing. */
+    @Volatile var viewAreaIndex: Int = airPlayConfig.main.initialViewArea
+        private set
+    private val viewAreaGeneration = AtomicInteger(0)
     @Volatile private var hotspot: WirelessHotspotManager? = null
     private val hotspotLifecycleLock = Any()
     @Volatile private var bonjour: CarPlayBonjour? = null
@@ -245,6 +251,17 @@ class CarPlayController(
     private val sessionListener = object : AirPlaySessionListener {
         override fun onSessionActive(session: AirPlaySession) {
             activeSession = session
+            val area = viewAreaIndex
+            val token = viewAreaGeneration.get()
+            if (area != airPlayConfig.main.initialViewArea) {
+                runCatching {
+                    touchExecutor.execute {
+                        if (!closed && activeSession === session && viewAreaGeneration.get() == token) {
+                            session.showViewArea(area)
+                        }
+                    }
+                }
+            }
             debugLog(
                 "AirPlay session active controller=${session.controllerId ?: "unknown"} " +
                     "peer=<redacted>",
@@ -348,6 +365,30 @@ class CarPlayController(
             restartWireless()
         } else {
             startIphone()
+        }
+    }
+
+    /** The main display as declared to the phone, including its view areas. */
+    val mainDisplay: AirPlayDisplayConfig get() = airPlayConfig.main
+
+    /** Switches only after viewAreas negotiation; the token and session identity discard stale tasks. */
+    fun showViewArea(index: Int): Boolean {
+        if (closed || index !in airPlayConfig.main.viewAreas.indices) return false
+        val session = activeSession ?: return false
+        if (!session.acceptsViewAreas()) return false
+        val token = viewAreaGeneration.incrementAndGet()
+        viewAreaIndex = index
+        return try {
+            touchExecutor.execute {
+                if (closed || activeSession !== session || viewAreaGeneration.get() != token) return@execute
+                if (!session.showViewArea(index)) {
+                    debugLog("AirPlay view area $index not accepted by session")
+                    uiListener?.onTransportError("AirPlay view area switch rejected")
+                }
+            }
+            true
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -505,6 +546,7 @@ class CarPlayController(
                     wirelessIdentification = null
                     wirelessAirPlayEndpoint = null
                     closeBestEffort("location provider") { locationProvider?.close() }
+                    closeBestEffort("vehicle data provider") { vehicleStatusProvider?.close() }
                 } finally {
                     executor.shutdownNow()
                     try {
@@ -848,7 +890,7 @@ class CarPlayController(
     private fun startPhone() {
         if (config.locationReportingEnabled) {
             val started = try {
-                locationProvider?.start() == true
+                locationProvider?.prewarm() == true
             } catch (error: Throwable) {
                 Log.w(
                     IphoneCarPlayConfiguration.TAG,
@@ -1032,10 +1074,11 @@ class CarPlayController(
                 session = channel,
                 mfi = Iap2MfiAuthenticationClient(mfi),
             ).run(
-                identification = identification,
+                identification = identification.copy(locationInformationEnabled = false, vehicleStatusCapabilities = emptySet()),
                 endpoint = endpoint,
                 bringUpTimeoutMillis = CONTROL_BRING_UP_TIMEOUT_MILLIS,
-                locationProvider = locationProvider,
+                locationProvider = null,
+                vehicleStatusProvider = null,
                 onReady = { activateMediaRemote(channel) },
                 onStopped = { deactivateMediaRemote(channel) },
                 onIncoming = ::onIap2Incoming,
@@ -1120,6 +1163,7 @@ class CarPlayController(
                         endpoint = endpoint,
                         bringUpTimeoutMillis = Iap2WirelessControlClient.NO_TIMEOUT_MILLIS,
                         locationProvider = locationProvider,
+                        vehicleStatusProvider = vehicleStatusProvider,
                         onReady = {
                             activateMediaRemote(channel)
                             onWirelessTunnelReady(generation)
@@ -1483,6 +1527,7 @@ class CarPlayController(
                 availableCurrentMilliAmps = config.availableCurrentMilliAmps,
                 bringUpTimeoutMillis = CONTROL_BRING_UP_TIMEOUT_MILLIS,
                 locationProvider = locationProvider,
+                vehicleStatusProvider = vehicleStatusProvider,
                 onReady = { activateMediaRemote(csm) },
                 onStopped = { deactivateMediaRemote(csm) },
                 onIncoming = ::onIap2Incoming,

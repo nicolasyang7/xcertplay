@@ -75,6 +75,7 @@ object AirPlayPersistence {
     private const val KEY_LOCAL_MFI_CERTIFICATE_URI = "local_mfi_certificate_uri"
     private const val KEY_LOCAL_MFI_PRIVATE_KEY_URI = "local_mfi_private_key_uri"
     private const val SAFE_AREA_KEY_PREFIX = "safe_area_"
+    private val SAFE_AREA_KEY_PATTERN = Regex("""safe_area_(\d{1,5})x(\d{1,5})""")
     private const val CUSTOM_ICON_FILE = "airplay-icon.png"
 
     const val DEFAULT_MANUFACTURER = "xcertplay"
@@ -175,7 +176,6 @@ object AirPlayPersistence {
             .putBoolean(KEY_CAR_BLUETOOTH_AUDIO, enabled)
             .apply()
     }
-
     fun loadMainMediaAudioBufferDurationMs(context: Context): Int =
         MainMediaAudioBuffer.sanitizeDurationMs(
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt(
@@ -436,6 +436,27 @@ object AirPlayPersistence {
             .apply()
     }
 
+    fun loadVehicleDataConfig(context: Context): com.shilapi.xcertplay.vehicle.VehicleDataConfig {
+        val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        return com.shilapi.xcertplay.vehicle.VehicleDataConfig(
+            enabled = com.shilapi.xcertplay.vehicle.VehicleDataFeature.entries.filter {
+                preferences.getBoolean("vehicle_data_${it.name}", it.defaultEnabled)
+            }.toSet(),
+            platform = runCatching { com.shilapi.xcertplay.vehicle.VehiclePlatform.valueOf(
+                preferences.getString("vehicle_data_platform", "STANDARD_ANDROID")!!)
+            }.getOrDefault(com.shilapi.xcertplay.vehicle.VehiclePlatform.STANDARD_ANDROID),
+        )
+    }
+
+    fun saveVehicleDataConfig(context: Context, config: com.shilapi.xcertplay.vehicle.VehicleDataConfig) {
+        val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("vehicle_data_platform", config.platform.name)
+        com.shilapi.xcertplay.vehicle.VehicleDataFeature.entries.forEach {
+            editor.putBoolean("vehicle_data_${it.name}", config.isEnabled(it))
+        }
+        editor.apply()
+    }
+
     fun loadManufacturer(context: Context): String =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_MANUFACTURER, null)
@@ -576,6 +597,14 @@ object AirPlayPersistence {
                 .getString(safeAreaKey(widthPixels, heightPixels), null),
         )
     }
+
+    /** Activity sizes ("width" to "height") that have a stored safe area, in key order. */
+    fun loadSafeAreaSizes(context: Context): List<Pair<Int, Int>> =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all.entries.mapNotNull { (key, value) ->
+            val match = SAFE_AREA_KEY_PATTERN.matchEntire(key) ?: return@mapNotNull null
+            if (SafeAreaCodec.decode(value as? String) == null) return@mapNotNull null
+            match.groupValues[1].toInt() to match.groupValues[2].toInt()
+        }.filter { (width, height) -> width > 0 && height > 0 }.sortedWith(compareBy({ it.first }, { it.second }))
 
     fun saveSafeAreaRect(
         context: Context,

@@ -53,6 +53,9 @@ data class Iap2IdentificationConfig(
     val wireless: Iap2WirelessIdentification? = null,
     /** Advertises and enables iAP2 LocationInformation from the accessory to the phone. */
     val locationInformationEnabled: Boolean = false,
+    val gpsLocationEnabled: Boolean = true,
+    val vehicleSpeedEnabled: Boolean = false,
+    val vehicleStatusCapabilities: Set<Int> = emptySet(),
     /** USB-IF identity used by StartHID; defaults match this app's existing AirPlay HID identity. */
     val hidVendorIdentifier: Int = 2,
     val hidProductIdentifier: Int = 1,
@@ -167,16 +170,16 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
         /** Builds the smallest honest LIVI-compatible wired or wireless IdentificationInformation. */
         fun identificationInformation(config: Iap2IdentificationConfig): Iap2Frame {
             val wireless = config.wireless
-            val sentMessages = if (config.locationInformationEnabled) {
+            val sentMessages = (if (config.locationInformationEnabled) {
                 MESSAGES_SENT_BY_ACCESSORY + LOCATION_INFORMATION
             } else {
                 MESSAGES_SENT_BY_ACCESSORY
-            }
-            val receivedMessages = if (config.locationInformationEnabled) {
+            }) + if (config.vehicleStatusCapabilities.isNotEmpty()) setOf(Iap2VehicleStatus.UPDATE) else emptySet()
+            val receivedMessages = (if (config.locationInformationEnabled) {
                 MESSAGES_RECEIVED_FROM_PHONE + START_LOCATION_INFORMATION + STOP_LOCATION_INFORMATION
             } else {
                 MESSAGES_RECEIVED_FROM_PHONE
-            }
+            }) + if (config.vehicleStatusCapabilities.isNotEmpty()) setOf(Iap2VehicleStatus.START, Iap2VehicleStatus.STOP) else emptySet()
             return Iap2Messages.build(Iap2Endpoints.IDENTIFICATION_INFORMATION) {
                 string(0, config.name)
                 string(1, config.modelIdentifier)
@@ -233,12 +236,26 @@ class Iap2IdentificationClient(private val session: Iap2Session) {
                     string(1, "Media Playback Remote")
                     u8(2, 1)
                 }
+                if (config.vehicleStatusCapabilities.isNotEmpty()) {
+                    group(20) {
+                        u16(0, 3)
+                        string(1, config.name)
+                        if (config.vehicleStatusCapabilities.any { it == 11 || it == 21 }) u8(2, 2)
+                        // No guessed engine, connectors or routing models for temperature-only sources.
+                        string(6, config.name)
+                    }
+                    group(21) {
+                        u16(0, 4)
+                        string(1, config.name)
+                        config.vehicleStatusCapabilities.sorted().forEach { void(it) }
+                    }
+                }
                 if (config.locationInformationEnabled) {
                     group(22) {
                         u16(0, 0)
                         string(1, config.name)
-                        void(17)
-                        void(18)
+                        if (config.gpsLocationEnabled) { void(17); void(18) }
+                        if (config.vehicleSpeedEnabled) void(20)
                     }
                 }
                 if (wireless != null) {
