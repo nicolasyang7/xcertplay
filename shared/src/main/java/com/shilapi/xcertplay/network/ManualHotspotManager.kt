@@ -74,6 +74,18 @@ class ManualHotspotManager(
         }
         require(timeoutMillis > 0) { "timeoutMillis must be positive" }
 
+        if (PlatformTetheringStart.supported()) {
+            try {
+                PlatformTetheringStart.start(appContext, object : android.os.ResultReceiver(null) {
+                    override fun onReceiveResult(resultCode: Int, resultData: android.os.Bundle?) {
+                        Log.i("ManualHotspotManager", "PlatformTetheringStart resultCode=$resultCode")
+                    }
+                }) { Log.i("ManualHotspotManager", it) }
+            } catch (t: Throwable) {
+                Log.w("ManualHotspotManager", "PlatformTetheringStart attempt: ${t.message}")
+            }
+        }
+
         val deadlineNanos = deadlineAfter(timeoutMillis)
         val apConfiguration = readApConfiguration()
         if (apConfiguration != null && apConfiguration.ssid != expectedSsid) {
