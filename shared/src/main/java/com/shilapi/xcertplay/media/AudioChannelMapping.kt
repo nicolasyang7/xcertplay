@@ -63,9 +63,9 @@ internal object AudioChannelMapper {
         "telephony" -> AudioChannelSelection(AudioChannel.PHONE, AudioContentType.SPEECH)
         "speechrecognition" ->
             AudioChannelSelection(AudioChannel.ASSISTANT, AudioContentType.SPEECH)
-        "media", "default", "compatibility" ->
+        "media", "compatibility" ->
             AudioChannelSelection(AudioChannel.MEDIA, AudioContentType.MUSIC)
-        "alert" -> AudioChannelSelection(AudioChannel.NAVIGATION, AudioContentType.SPEECH)
+        "default", "alert" -> AudioChannelSelection(AudioChannel.NAVIGATION, AudioContentType.SPEECH)
         else -> mainHighAudioOrNavigation(payloadType)
     }
 

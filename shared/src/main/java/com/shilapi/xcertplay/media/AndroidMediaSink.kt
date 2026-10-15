@@ -871,14 +871,14 @@ private class AudioRenderer(
         // AudioTrack consumes 16-bit PCM, so frame size follows the channel mask configured above.
         trackBytesPerFrame = trackChannelCount * BYTES_PER_PCM_16_SAMPLE
 
-        val isMedia = format.audioType == "media" || format.audioType == "mainAudio" || configuredMainMediaBuffer
+        val isMedia = channelSelection.channel == AudioChannel.MEDIA
         clockTrim = if (isMedia && trackBytesPerFrame > 0) {
             MediaClockTrim(format.sampleRate, (startThresholdBytes / trackBytesPerFrame).toLong())
         } else {
             null
         }
 
-        if (format.audioType == "telephony") {
+        if (channelSelection.channel == AudioChannel.PHONE) {
             val listener = AudioRouting.OnRoutingChangedListener { routing -> checkCallRoute(routing.routedDevice) }
             if (runCatching { built.addOnRoutingChangedListener(listener, Handler(Looper.getMainLooper())) }.isSuccess) {
                 routingListener = listener
@@ -908,19 +908,19 @@ private class AudioRenderer(
         return byteArrayOf((value ushr 8).toByte(), value.toByte())
     }
 
-    private fun audioAttributes(): AudioAttributes {
-        val mode = if (advancedAudioChannelMapping) {
+    private val channelSelection = AudioChannelMapper.map(
+        audioType = format.audioType,
+        payloadType = format.payloadType,
+        mode = if (advancedAudioChannelMapping) {
             AudioChannelMappingMode.AUTOMOTIVE_BUS
         } else {
             AudioChannelMappingMode.MOBILE_COMPATIBLE
-        }
-        val selection = AudioChannelMapper.map(
-            audioType = format.audioType,
-            payloadType = format.payloadType,
-            mode = mode,
-        )
-        val usage = usageFor(selection.channel)
-        val contentType = contentTypeFor(selection.contentType)
+        },
+    )
+
+    private fun audioAttributes(): AudioAttributes {
+        val usage = usageFor(channelSelection.channel)
+        val contentType = contentTypeFor(channelSelection.contentType)
         return AudioAttributes.Builder()
             .setUsage(usage)
             .setContentType(contentType)
@@ -929,7 +929,7 @@ private class AudioRenderer(
                 Log.i(
                     TAG,
                     "audio route type=${format.payloadType} audioType=${format.audioType} " +
-                        "mode=$mode channel=${selection.channel} " +
+                        "channel=${channelSelection.channel} " +
                         "usage=$usage contentType=$contentType",
                 )
             }
@@ -1118,7 +1118,7 @@ private class AudioRenderer(
             totalBytesWritten += count
             if (playbackStarted) {
                 trimClock(track)
-                if (format.audioType == "telephony" && callSpeaker == null) {
+                if (channelSelection.channel == AudioChannel.PHONE && callSpeaker == null) {
                     runCatching { checkCallRoute(track.routedDevice) }
                 }
             }
@@ -1139,7 +1139,7 @@ private class AudioRenderer(
                 if (prebufferBytes >= startThresholdBytes) {
                     track.play()
                     playbackStarted = true
-                    if (format.audioType == "telephony") {
+                    if (channelSelection.channel == AudioChannel.PHONE) {
                         runCatching { checkCallRoute(track.routedDevice) }
                     }
                     Log.i(TAG, "audio playback started type=${format.payloadType}")
@@ -1279,7 +1279,7 @@ private class AudioRenderer(
     }
 
     private fun applyNavigationAttenuation(track: AudioTrack) {
-        val isNav = format.audioType == "navigation" || format.audioType == "speechrecognition"
+        val isNav = channelSelection.channel == AudioChannel.NAVIGATION
         if (!isNav) return
         val requestedDb = navigationAttenuationDb
         if (requestedDb == 0 && appliedNavigationAttenuationDb == null) return
