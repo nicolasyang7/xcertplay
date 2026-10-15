@@ -16,7 +16,7 @@ class AmapBroadcastEmitter(
     // Standard global AMap broadcast; the active dynamic receiver subscribes by action.
     private val targetPackage: String? = null,
     // Modified AMap external bridge requires this marker on the global action.
-    private val factoryHudBridge: Boolean = false,
+    private val factoryHudBridge: Boolean = true,
     private val onLog: (String) -> Unit = {},
 ) {
     companion object {
@@ -89,12 +89,12 @@ class AmapBroadcastEmitter(
             val totalTime = guidance.totalRemainingTimeSeconds ?: -1
             if (totalDis > 0) {
                 putExtra("ROUTE_REMAIN_DIS", totalDis)
-                putExtra("ROUTE_REMAIN_DIS_AUTO", formatDistanceText(totalDis))
             }
+            putExtra("ROUTE_REMAIN_DIS_AUTO", if (totalDis >= 0) formatDistanceText(totalDis) else "")
             if (totalTime > 0) {
                 putExtra("ROUTE_REMAIN_TIME", totalTime)
-                putExtra("ROUTE_REMAIN_TIME_AUTO", formatTimeText(totalTime))
             }
+            putExtra("ROUTE_REMAIN_TIME_AUTO", if (totalTime >= 0) formatTimeText(totalTime) else "")
             val allDis = if (initialTotalDistanceMeters > 0) initialTotalDistanceMeters else totalDis
             if (allDis > 0) putExtra("ROUTE_ALL_DIS", allDis)
 
@@ -118,7 +118,7 @@ class AmapBroadcastEmitter(
      * Emits lane line recommendations (KEY_TYPE = 13012).
      */
     fun emitLaneGuidance(laneInfo: LaneGuidanceInfo) {
-        if (!navigationSent || !laneInfo.verifiedFromIphone || laneInfo.lanes.isEmpty()) return
+        if (!navigationSent || laneInfo.lanes.isEmpty()) return
 
         val laneJson = buildLaneJson(laneInfo)
         val intent = Intent(broadcastAction).apply {

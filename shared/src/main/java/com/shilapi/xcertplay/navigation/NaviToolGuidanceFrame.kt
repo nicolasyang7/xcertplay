@@ -19,6 +19,7 @@ internal data class NaviToolGuidanceFrame(
         private const val SHARP_RIGHT = 7
         private const val U_TURN_LEFT = 8
         private const val STRAIGHT = 9
+        private const val ROUNDABOUT_ENTER = 11
         private const val ROUNDABOUT_EXIT = 12
         private const val DESTINATION = 15
         private const val U_TURN_RIGHT = 19
@@ -44,7 +45,7 @@ internal data class NaviToolGuidanceFrame(
                 13, 22, 49, 52 -> SLIGHT_LEFT
                 14, 23, 50, 53 -> SLIGHT_RIGHT
                 4, 18, 19, 26 -> if (leftHandTraffic) U_TURN_RIGHT else U_TURN_LEFT
-                6 -> ROUNDABOUT_EXIT
+                6 -> ROUNDABOUT_ENTER
                 7 -> ROUNDABOUT_EXIT
                 10, 12, 24, 25, 27 -> DESTINATION
                 3, 5, 11, 51 -> STRAIGHT

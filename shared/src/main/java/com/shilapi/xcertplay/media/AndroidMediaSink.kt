@@ -2,8 +2,10 @@ package com.shilapi.xcertplay.media
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.AudioRouting
 import android.media.AudioFormat as AndroidAudioFormat
 import android.media.AudioTimestamp
 import android.media.AudioTrack
@@ -201,18 +203,27 @@ class AndroidMediaSink(
             )
         }
 
+    @Volatile private var navigationAttenuationDb: Int = 0
+
+    fun setNavigationAttenuationDb(db: Int) {
+        navigationAttenuationDb = NavigationAudioGain.clamp(db)
+        audioRenderers.values.forEach { it.setNavigationAttenuationDb(navigationAttenuationDb) }
+    }
+
     @Synchronized
     private fun audioRenderer(type: Int, format: AudioFormat): AudioRenderer {
         val existing = audioRenderers[type]
         if (existing?.format == format) return existing
         existing?.close()
         return AudioRenderer(
+            context,
             type,
             format,
             advancedAudioChannelMapping,
             mainMediaAudioBufferDurationMs,
             mediaMetricsMonitor,
             mediaTap,
+            navigationAttenuationDb,
         ).also {
             audioRenderers[type] = it
         }
@@ -691,15 +702,23 @@ private fun MediaFormat.intOrNull(key: String): Int? =
 
 /** Decodes AAC-LC/Opus to PCM and plays it, or plays wired LPCM directly. */
 private class AudioRenderer(
+    private val context: Context,
     private val stream: Int,
     val format: AudioFormat,
     private val advancedAudioChannelMapping: Boolean,
     private val mainMediaAudioBufferDurationMs: Int,
     mediaMetricsMonitor: MediaMetricsMonitor?,
     private val mediaTap: MediaTap?,
+    initialNavigationAttenuationDb: Int = 0,
 ) : Closeable {
     private data class AudioPacket(val rtp: ByteArray, val sample: Int)
 
+    private val audioManager = context.getSystemService(AudioManager::class.java)
+    private var clockTrim: MediaClockTrim? = null
+    private var routingListener: AudioRouting.OnRoutingChangedListener? = null
+    private var callSpeaker: CallSpeaker? = null
+    @Volatile private var navigationAttenuationDb = NavigationAudioGain.clamp(initialNavigationAttenuationDb)
+    private var appliedNavigationAttenuationDb: Int? = null
     private val queue = LinkedBlockingQueue<AudioPacket>(MAX_QUEUED_PACKETS)
     @Volatile private var running = true
     @Volatile private var started = false
@@ -836,7 +855,7 @@ private class AudioRenderer(
         } else {
             maxOf(minBuffer, MIN_START_BUFFER_BYTES)
         }
-        track = AudioTrack.Builder()
+        val built = AudioTrack.Builder()
             .setAudioAttributes(audioAttributes())
             .setAudioFormat(
                 AndroidAudioFormat.Builder()
@@ -848,8 +867,25 @@ private class AudioRenderer(
             .setBufferSizeInBytes(bufferBytes)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
+        track = built
         // AudioTrack consumes 16-bit PCM, so frame size follows the channel mask configured above.
         trackBytesPerFrame = trackChannelCount * BYTES_PER_PCM_16_SAMPLE
+
+        val isMedia = format.audioType == "media" || format.audioType == "mainAudio" || configuredMainMediaBuffer
+        clockTrim = if (isMedia && trackBytesPerFrame > 0) {
+            MediaClockTrim(format.sampleRate, (startThresholdBytes / trackBytesPerFrame).toLong())
+        } else {
+            null
+        }
+
+        if (format.audioType == "telephony") {
+            val listener = AudioRouting.OnRoutingChangedListener { routing -> checkCallRoute(routing.routedDevice) }
+            if (runCatching { built.addOnRoutingChangedListener(listener, Handler(Looper.getMainLooper())) }.isSuccess) {
+                routingListener = listener
+            }
+            runCatching { checkCallRoute(built.routedDevice) }
+        }
+        applyNavigationAttenuation(built)
         Log.i(
             TAG,
             "audio track prepared type=${format.payloadType} audioType=${format.audioType} " +
@@ -1080,6 +1116,12 @@ private class AudioRenderer(
             if (count <= 0) break
             written += count
             totalBytesWritten += count
+            if (playbackStarted) {
+                trimClock(track)
+                if (format.audioType == "telephony" && callSpeaker == null) {
+                    runCatching { checkCallRoute(track.routedDevice) }
+                }
+            }
             val monitor = mediaMetricsMonitor
             if (monitor != null) {
                 val nowNs = System.nanoTime()
@@ -1097,6 +1139,9 @@ private class AudioRenderer(
                 if (prebufferBytes >= startThresholdBytes) {
                     track.play()
                     playbackStarted = true
+                    if (format.audioType == "telephony") {
+                        runCatching { checkCallRoute(track.routedDevice) }
+                    }
                     Log.i(TAG, "audio playback started type=${format.payloadType}")
                 }
             }
@@ -1204,6 +1249,12 @@ private class AudioRenderer(
         val track = track
         this.track = null
         if (track != null) {
+            routingListener?.let { listener ->
+                runCatching { track.removeOnRoutingChangedListener(listener) }
+            }
+            routingListener = null
+            callSpeaker?.restore()
+            callSpeaker = null
             try {
                 track.pause()
             } catch (_: Exception) {
@@ -1219,6 +1270,53 @@ private class AudioRenderer(
             } catch (_: Exception) {
                 // Best effort.
             }
+        }
+    }
+
+    fun setNavigationAttenuationDb(db: Int) {
+        navigationAttenuationDb = NavigationAudioGain.clamp(db)
+        track?.let { applyNavigationAttenuation(it) }
+    }
+
+    private fun applyNavigationAttenuation(track: AudioTrack) {
+        val isNav = format.audioType == "navigation" || format.audioType == "speechrecognition"
+        if (!isNav) return
+        val requestedDb = navigationAttenuationDb
+        if (requestedDb == 0 && appliedNavigationAttenuationDb == null) return
+        if (appliedNavigationAttenuationDb == requestedDb) return
+        val gain = NavigationAudioGain.linear(requestedDb)
+        val success = runCatching { track.setVolume(gain) == AudioTrack.SUCCESS }.getOrDefault(false)
+        if (success) {
+            appliedNavigationAttenuationDb = requestedDb
+            Log.i(TAG, "Audio: navigation attenuation=${requestedDb}dB applied=true")
+        }
+    }
+
+    private fun checkCallRoute(device: AudioDeviceInfo?) {
+        if (device?.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) {
+            moveCallToLoudspeaker()
+        }
+    }
+
+    private fun moveCallToLoudspeaker() {
+        val manager = audioManager ?: return
+        if (callSpeaker != null) return
+        callSpeaker = CallSpeaker.on(manager)
+        Log.i(TAG, "Audio: call routed to earpiece; moved to loudspeaker=${callSpeaker != null} stream=$stream")
+    }
+
+    private fun trimClock(track: AudioTrack) {
+        val trim = clockTrim ?: return
+        val now = System.nanoTime()
+        val totalFrames = totalBytesWritten / trackBytesPerFrame
+        val headFrames = playbackHeadFrames(track)
+        val queuedFrames = (totalFrames - headFrames).coerceAtLeast(0L)
+        trim.sample(queuedFrames, now)
+        val rate = trim.rateDue(now) ?: return
+        val result = runCatching { track.setPlaybackRate(rate) }.getOrDefault(AudioTrack.ERROR)
+        if (result != AudioTrack.SUCCESS) {
+            clockTrim = null
+            Log.w(TAG, "Audio: clock trim off audioType=${format.audioType} rate=$rate result=$result")
         }
     }
 

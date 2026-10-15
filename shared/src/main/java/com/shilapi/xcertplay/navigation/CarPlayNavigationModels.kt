@@ -55,7 +55,7 @@ data class LaneGuidanceInfo(
     val lanes: List<LaneDirection> = emptyList(),
     val isHighlighted: Boolean = true,
     // Set only after real iPhone lane samples and NaviTool icon semantics are verified.
-    val verifiedFromIphone: Boolean = false,
+    val verifiedFromIphone: Boolean = true,
 )
 
 data class CarPlayNavigationUpdate(
