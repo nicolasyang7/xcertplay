@@ -178,6 +178,7 @@ class CarPlayHostActivity : ComponentActivity() {
         val safeAreaSize: DisplaySize?,
         val safeAreaRect: SafeAreaRect?,
         val customIconBytes: ByteArray?,
+        val synologyConfig: SynologyLogSettings.Config,
     )
 
     private lateinit var airPlayIdentity: AirPlayIdentity
@@ -470,6 +471,14 @@ class CarPlayHostActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val teardownExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val airPlayCommandExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val diagnosticUploadExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val synologyUploader = SynologyQuickConnectClient()
+    private var synologyQcId by mutableStateOf("")
+    private var synologyUsername by mutableStateOf("")
+    private var synologyPassword by mutableStateOf("")
+    private var synologyFolder by mutableStateOf("/docker/navitool-dashboard/data/logs")
+    private var synologyOverrideUrl by mutableStateOf("")
+    private var synologyUploadInProgress by mutableStateOf(false)
     private val logLines = ScreenLogBuffer(MAX_SCREEN_LOG_LINES)
     private val pendingScreenLogs = ArrayDeque<PendingLog>()
     private val pendingScreenLogsLock = Any()
@@ -644,6 +653,13 @@ class CarPlayHostActivity : ComponentActivity() {
         manualHotspotSecurity = AirPlayPersistence.loadManualHotspotSecurity(this)
         wirelessPermissionsReady = !wirelessEnabled || hasRequiredWirelessPermissions()
         manualHotspotChannelText = manualHotspotChannel.toString()
+        SynologyLogSettings.load(this).let { config ->
+            synologyQcId = config.quickConnectId
+            synologyUsername = config.username
+            synologyPassword = config.password
+            synologyFolder = config.destinationFolder
+            synologyOverrideUrl = config.overrideUrl
+        }
     }
 
     private fun requestStartupPrerequisites() {
@@ -776,6 +792,7 @@ class CarPlayHostActivity : ComponentActivity() {
 
     override fun onDestroy() {
         GeelyWheelKeys.stop()
+        diagnosticUploadExecutor.shutdownNow()
         CarPlayBackgroundSession.audioFocus(this).release(this)
         stopMicrophoneGainTest()
         mainHandler.removeCallbacks(applyDisplaySize)
@@ -1132,6 +1149,7 @@ class CarPlayHostActivity : ComponentActivity() {
         AirPlayPersistence.saveHideTopBar(this, hideTopBar)
         AirPlayPersistence.saveHideBottomBar(this, hideBottomBar)
         AirPlayPersistence.saveSafeAreaDrawOutside(this, safeAreaDrawOutside)
+        saveSynologyLogSettings()
     }
 
     private fun captureSettingsBaseline(): SettingsBaseline {
@@ -1148,11 +1166,13 @@ class CarPlayHostActivity : ComponentActivity() {
                 AirPlayPersistence.loadSafeAreaRect(this, it.width, it.height)
             },
             customIconBytes = customIconBytes,
+            synologyConfig = SynologyLogSettings.load(this),
         )
     }
 
     private fun restoreSettingsBaseline() {
         val baseline = settingsBaseline ?: return
+        SynologyLogSettings.save(this, baseline.synologyConfig)
         loadPersistedSettings()
         resetWebDisplayDrafts()
         updateWebDisplayPreviews()
@@ -3850,6 +3870,78 @@ class CarPlayHostActivity : ComponentActivity() {
                 )
             }
         }
+        SectionHeader(tr("settings.synology.header"))
+        SettingsGroup {
+            row {
+                FieldRow(
+                    label = tr("settings.synology.qc_id"),
+                    value = synologyQcId,
+                    onValueChange = {
+                        synologyQcId = it
+                        saveSynologyLogSettings()
+                    },
+                    help = tr("settings.synology.qc_id.help"),
+                )
+            }
+            row {
+                FieldRow(
+                    label = tr("settings.synology.username"),
+                    value = synologyUsername,
+                    onValueChange = {
+                        synologyUsername = it
+                        saveSynologyLogSettings()
+                    },
+                )
+            }
+            row {
+                FieldRow(
+                    label = tr("settings.synology.password"),
+                    value = synologyPassword,
+                    onValueChange = {
+                        synologyPassword = it
+                        saveSynologyLogSettings()
+                    },
+                    password = true,
+                )
+            }
+            row {
+                FieldRow(
+                    label = tr("settings.synology.folder"),
+                    value = synologyFolder,
+                    onValueChange = {
+                        synologyFolder = it
+                        saveSynologyLogSettings()
+                    },
+                    help = tr("settings.synology.folder.help"),
+                )
+            }
+            row {
+                FieldRow(
+                    label = tr("settings.synology.override_url"),
+                    value = synologyOverrideUrl,
+                    onValueChange = {
+                        synologyOverrideUrl = it
+                        saveSynologyLogSettings()
+                    },
+                    help = tr("settings.synology.override_url.help"),
+                )
+            }
+            row {
+                FlowButtons {
+                    Button(
+                        onClick = { uploadDiagnosticLogsToSynology() },
+                        enabled = !synologyUploadInProgress,
+                    ) {
+                        LvIcon(R.drawable.ic_ms_cast, size = 18.dp)
+                        Spacer(Modifier.width(Space.s2))
+                        Text(
+                            if (synologyUploadInProgress) tr("settings.synology.uploading") else tr("settings.synology.upload_button"),
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                    }
+                }
+            }
+        }
         SectionHeader(tr("settings.diagnostics.summary"))
         SettingsGroup { row { KeyValueList(configSummary) } }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -3859,6 +3951,89 @@ class CarPlayHostActivity : ComponentActivity() {
                 tr("settings.compat.title"),
                 body = tr("settings.compat.p2p") + "\n" + tr("settings.compat.hevc"),
             )
+        }
+    }
+
+    private fun saveSynologyLogSettings() {
+        SynologyLogSettings.save(
+            this,
+            SynologyLogSettings.Config(
+                quickConnectId = synologyQcId,
+                username = synologyUsername,
+                password = synologyPassword,
+                destinationFolder = synologyFolder,
+                overrideUrl = synologyOverrideUrl,
+            ),
+        )
+    }
+
+    private fun diagnosticLogFiles(): List<File> {
+        val logDirectory = File(getExternalFilesDir(null) ?: filesDir, "logs")
+        return listOf(
+            File(logDirectory, "xcertplay.log"),
+            File(logDirectory, "xcertplay.previous.log"),
+        ).filter { it.isFile && it.length() > 0L }
+    }
+
+    private fun uploadDiagnosticLogsToSynology() {
+        if (synologyUploadInProgress) {
+            Toast.makeText(this, tr("settings.synology.uploading_busy"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (synologyQcId.isBlank() && synologyOverrideUrl.isBlank()) {
+            Toast.makeText(this, tr("settings.synology.error_qc"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (synologyUsername.isBlank() || synologyPassword.isBlank()) {
+            Toast.makeText(this, tr("settings.synology.error_credentials"), Toast.LENGTH_SHORT).show()
+            return
+        }
+        saveSynologyLogSettings()
+        synologyUploadInProgress = true
+        appendLog("EVENT log/synology_upload requested")
+        Toast.makeText(this, tr("settings.synology.uploading_start"), Toast.LENGTH_SHORT).show()
+
+        try {
+            diagnosticUploadExecutor.execute {
+                val resultText = runCatching {
+                    sessionLog.flushAndWait()
+                    val sources = diagnosticLogFiles()
+                    check(sources.isNotEmpty()) { tr("settings.synology.error_no_logs") }
+                    val staging = File(cacheDir, "synology-log-upload").apply { mkdirs() }
+                    var status = ""
+                    for (source in sources) {
+                        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+                        val uploadFile = File(staging, "xcertplay_${stamp}_${source.name}")
+                        source.copyTo(uploadFile, overwrite = true)
+                        val result = synologyUploader.upload(
+                            synologyQcId,
+                            synologyUsername,
+                            synologyPassword,
+                            null,
+                            synologyFolder,
+                            uploadFile,
+                            synologyOverrideUrl,
+                        )
+                        uploadFile.delete()
+                        if (!result.success) {
+                            error(result.message)
+                        }
+                        status = result.resolvedUrl ?: "direct"
+                    }
+                    appendLog("EVENT log/synology_upload success url=$status")
+                    tr("settings.synology.upload_success")
+                }.getOrElse { error ->
+                    appendLog("EVENT log/synology_upload error=${error.message}")
+                    "${tr("settings.synology.upload_failed")}: ${error.message}"
+                }
+                runOnUiThread {
+                    synologyUploadInProgress = false
+                    Toast.makeText(this, resultText, Toast.LENGTH_LONG).show()
+                }
+            }
+        } catch (t: Throwable) {
+            synologyUploadInProgress = false
+            Toast.makeText(this, "${tr("settings.synology.upload_failed")}: ${t.message}", Toast.LENGTH_LONG).show()
         }
     }
 
