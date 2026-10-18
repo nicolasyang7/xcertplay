@@ -36,7 +36,7 @@ class Iap2WirelessSessionReplayTest {
         val identification = parameters(replay.sent.first())
         assertEquals(RECORDED_SENT, u16Values(identification.single { it.id == 6 }.payload))
         assertEquals(RECORDED_RECEIVED, u16Values(identification.single { it.id == 7 }.payload))
-        assertEquals(listOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 17, 18, 24), identification.map { it.id })
+        assertEquals(listOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 17, 18, 24, 30), identification.map { it.id })
 
         assertArrayEquals(FAKE_CERTIFICATE, parameters(replay.sent[1]).single().payload)
         assertArrayEquals(Iap2WirelessControlClient.accessoryWiFiConfiguration(ENDPOINT).payload, replay.sent[9].payload)
@@ -81,7 +81,7 @@ class Iap2WirelessSessionReplayTest {
             RECORDED_RECEIVED.dropLast(3) + listOf(0xfffa, 0xfffc) + RECORDED_RECEIVED.takeLast(3),
             u16Values(identification.single { it.id == 7 }.payload),
         )
-        assertEquals(listOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 17, 18, 22, 24), identification.map { it.id })
+        assertEquals(listOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 17, 18, 22, 24, 30), identification.map { it.id })
 
         assertEquals(listOf(setOf(1, 2)), location.requested)
         // One parameter 0 per subscribed sentence, each CRLF and NUL terminated.

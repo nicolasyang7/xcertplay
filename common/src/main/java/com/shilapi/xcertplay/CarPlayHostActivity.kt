@@ -575,6 +575,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var edgeSettingsGestureCaptured = false
     private var edgeSettingsGestureEligible = false
     private val shuttingDown = AtomicBoolean(false)
+    private val mainHandler = Handler(Looper.getMainLooper())
     // Only exitApplication shuts these down, and Activities are recreated often (language,
     // back and reopen), so their single worker retires when idle instead of leaking per instance.
     private val teardownExecutor: ExecutorService = idleRetiringSingleThreadExecutor()
