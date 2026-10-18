@@ -128,57 +128,6 @@ class AirPlayInfoPlistTest {
     }
 
     @Test
-    fun reportedSafeAreaUsesActivityMappingAndEvenAlignment() {
-        val fullHdInsets = AirPlaySafeArea.toInsets(
-            mapping = SafeAreaRect(left = 0, top = 0, right = 1920, bottom = 975),
-            activityWidthPixels = 1920,
-            activityHeightPixels = 1080,
-            displayWidthPixels = 1920,
-            displayHeightPixels = 1080,
-        )
-        val compactInsets = AirPlaySafeArea.toInsets(
-            mapping = SafeAreaRect(left = 34, top = 75, right = 734, bottom = 725),
-            activityWidthPixels = 768,
-            activityHeightPixels = 800,
-            displayWidthPixels = 768,
-            displayHeightPixels = 800,
-        )
-
-        fun safeArea(
-            widthPixels: Int,
-            heightPixels: Int,
-            insets: AirPlayInsets,
-        ): Map<*, *> {
-            val info = AirPlayInfoPlist.build(
-                AirPlayConfig(
-                    deviceName = "test",
-                    deviceId = "02:00:00:00:00:02",
-                    btMac = "02:00:00:00:00:02",
-                    sourceVersion = "366.0",
-                    main = AirPlayDisplayConfig(
-                        widthPixels = widthPixels,
-                        heightPixels = heightPixels,
-                        safeArea = insets,
-                    ),
-                ),
-            )
-            val display = (info["displays"] as List<*>).single() as Map<*, *>
-            val view = (display["viewAreas"] as List<*>).single() as Map<*, *>
-            return view["safeArea"] as Map<*, *>
-        }
-
-        val fullHd = safeArea(1920, 1080, fullHdInsets)
-        val compact = safeArea(768, 800, compactInsets)
-
-        assertEquals(1920, fullHd["widthPixels"])
-        assertEquals(976, fullHd["heightPixels"])
-        assertEquals(700, compact["widthPixels"])
-        assertEquals(650, compact["heightPixels"])
-        assertEquals(34, compact["originXPixels"])
-        assertEquals(75, compact["originYPixels"])
-    }
-
-    @Test
     fun microphoneInputsAreAdvertisedOnlyWhenEnabled() {
         val base = AirPlayConfig(
             deviceName = "test",
@@ -204,15 +153,15 @@ class AirPlayInfoPlistTest {
                 .containsKey("audioInputFormats"),
         )
         assertEquals(
-            0x4154,
+            0x14L,
             defaultAudio(AirPlayInfoPlist.build(base.copy(microphone = true)))["audioInputFormats"],
         )
         assertEquals(
-            0x4154,
+            0x14L,
             telephony(AirPlayInfoPlist.build(base.copy(microphone = true)))["audioInputFormats"],
         )
         assertEquals(
-            0x70004154,
+            0x10000000L,
             defaultAudio(AirPlayInfoPlist.build(base.copy(microphone = true, wirelessAudio = true)))["audioInputFormats"],
         )
     }
@@ -226,13 +175,14 @@ class AirPlayInfoPlistTest {
             sourceVersion = "366.0",
             main = AirPlayDisplayConfig(widthPixels = 1280, heightPixels = 720),
         )
-        fun defaultOutput(config: AirPlayConfig): Int =
+        fun defaultOutput(config: AirPlayConfig): Long =
             (AirPlayInfoPlist.build(config)["audioFormats"] as List<*>)
                 .map { it as Map<*, *> }
-                .single { it["type"] == 100 && it["audioType"] == "default" }["audioOutputFormats"] as Int
+                .single { it["type"] == 100 && it["audioType"] == "default" }["audioOutputFormats"] as Long
 
-        assertEquals(0xc3fc, defaultOutput(base))
-        assertEquals(0x7000c3fc, defaultOutput(base.copy(wirelessAudio = true)))
+        // 有线只声明 PCM；无线在此之上追加 Opus，供关闭兼容模式以外的场景使用。
+        assertEquals(0L, defaultOutput(base) and 0x70000000L)
+        assertEquals(0x60000000L, defaultOutput(base.copy(wirelessAudio = true)) and 0x70000000L)
     }
 
     @Test

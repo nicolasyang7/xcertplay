@@ -14,21 +14,22 @@ import kotlin.math.pow
 internal const val MICROPHONE_CAPTURE_RATE_HZ = 16_000
 
 internal fun openMicrophoneRecorder(
+    sampleRate: Int = MICROPHONE_CAPTURE_RATE_HZ,
     requestedBufferBytes: Int,
     audioSource: Int = MediaRecorder.AudioSource.MIC,
 ): AudioRecord {
     val minBuffer = AudioRecord.getMinBufferSize(
-        MICROPHONE_CAPTURE_RATE_HZ,
+        sampleRate,
         AndroidAudioFormat.CHANNEL_IN_MONO,
         AndroidAudioFormat.ENCODING_PCM_16BIT,
     )
-    check(minBuffer > 0) { "microphone unavailable at $MICROPHONE_CAPTURE_RATE_HZ Hz" }
+    check(minBuffer > 0) { "microphone unavailable at $sampleRate Hz" }
     val recorder = AudioRecord.Builder()
         .setAudioSource(audioSource)
         .setAudioFormat(
             AndroidAudioFormat.Builder()
                 .setEncoding(AndroidAudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(MICROPHONE_CAPTURE_RATE_HZ)
+                .setSampleRate(sampleRate)
                 .setChannelMask(AndroidAudioFormat.CHANNEL_IN_MONO)
                 .build(),
         )
@@ -181,7 +182,7 @@ class MicrophoneLevelMonitor(
             audioModeLease = MicrophoneAudioMode.acquire(appContext)
             val frameBytes =
                 MICROPHONE_CAPTURE_RATE_HZ * BYTES_PER_SAMPLE * REPORT_MILLIS / 1000
-            activeRecorder = openMicrophoneRecorder(frameBytes * 2)
+            activeRecorder = openMicrophoneRecorder(MICROPHONE_CAPTURE_RATE_HZ, frameBytes * 2)
             recorder = activeRecorder
             if (!running.get()) return
             activeRecorder.startRecording()
@@ -273,7 +274,7 @@ internal class PcmMonoResampler(
 
     fun convert(input: ByteArray, offset: Int, count: Int): ByteArray {
         require(offset >= 0 && count >= 0 && offset + count <= input.size)
-        val output = ByteArrayOutputStream(count * outputRate / inputRate + 4)
+        val output = ByteArrayOutputStream((count.toLong() * outputRate / inputRate + 4).toInt())
         var cursor = offset
         val end = offset + count
         if (pendingLowByte >= 0 && cursor < end) {

@@ -100,6 +100,31 @@ class HandshakeTimelineTest {
     }
 
     @Test
+    fun clusterSessionNegotiatesAltScreenAndBringsUpEveryStream() {
+        val timeline = replay("handshake-wireless-cluster.txt")
+
+        assertNull(timeline.failure)
+        timeline.phases.forEach { assertEquals(it.label, State.DONE, it.state) }
+        assertEquals(LinkState.RELEASED, link(timeline, LinkKind.RFCOMM))
+        assertEquals(LinkState.UP, link(timeline, LinkKind.TUNNEL))
+        val chips = timeline.groups.flatMap { it.rows }.first { it.name.startsWith("Features:") }.chips
+        assertEquals(
+            listOf("uiContext", "viewAreas", "altScreen", "hevc", "iAPChannel"),
+            chips.filter { it.state == ChipState.OK }.map { it.label },
+        )
+        assertEquals(
+            listOf("type 111 · cluster screen", "type 110 · main screen"),
+            timeline.groups.first { it.title == HandshakeTimeline.G_STREAMS }.rows.map { it.name },
+        )
+        assertEquals("dataPort 37511 · streamID 1",
+            timeline.groups.first { it.title == HandshakeTimeline.G_TUNNEL_STREAM }.rows.first().reply?.meaning)
+        assertEquals("StartLocationInformation",
+            timeline.groups.single { it.phase.kind == PhaseKind.HANDOFF && it.rows.any { r -> r.code == "0xfffa" } }.rows.single().name)
+        // A plain CarPlay phone without Ultra identification gets no Ultra warning.
+        assertTrue(timeline.groups.flatMap { it.rows }.none { it.warning })
+    }
+
+    @Test
     fun waitingForIphoneIsReportedWhileInProgress() {
         val timeline = HandshakeTimeline(wireless = true, startedAtMillis = 0)
         lines("handshake-wireless.txt").takeWhile { !it.second.startsWith("wireless RFCOMM connected") }
@@ -174,6 +199,20 @@ class HandshakeTimelineTest {
         assertEquals("0x1234", timeline.latestRow?.code)
         assertEquals(Direction.PHONE_TO_ACCESSORY, timeline.latestRow?.direction)
         assertEquals(12, timeline.latestRow?.bytes)
+    }
+
+    @Test
+    fun periodicFramesKeepTheGroupBoundedAndItsAnchorRow() {
+        val timeline = HandshakeTimeline(wireless = false, startedAtMillis = 0)
+        repeat(5_000) {
+            timeline.accept("IAP2 TX [wired] 0xfffb LocationInformation frame=80B body=72 params", 100L + it)
+        }
+
+        val group = timeline.groups.single { group -> group.rows.any { it.code == "0xfffb" } }
+        assertEquals(100, group.rows.size)
+        assertEquals(100L, group.rows.first().atMillis)
+        assertEquals(5_099L, group.rows.last().atMillis)
+        assertEquals(group.rows.last(), timeline.latestRow)
     }
 
     @Test

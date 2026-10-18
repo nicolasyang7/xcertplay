@@ -1,5 +1,12 @@
 package com.shilapi.xcertplay
 
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
 import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Intent
@@ -15,15 +22,19 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.Toast
@@ -31,6 +42,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.DrawableRes
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -65,6 +79,7 @@ import androidx.compose.material3.Surface as M3Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -78,6 +93,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.ComposeView
@@ -86,6 +102,11 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.shilapi.xcertplay.airplay.AudioCodecKind
+import com.shilapi.xcertplay.airplay.AudioQualityLimit
+import com.shilapi.xcertplay.airplay.AudioQualityProfiles
+import com.shilapi.xcertplay.airplay.AudioQualitySettings
+import com.shilapi.xcertplay.media.AudioQualityCapabilities
 import com.shilapi.xcertplay.airplay.AirPlayConfig
 import com.shilapi.xcertplay.airplay.AirPlayDisplaySettings
 import com.shilapi.xcertplay.airplay.AirPlayPhysicalSizeBasis
@@ -105,6 +126,7 @@ import com.shilapi.xcertplay.ui.components.Banner
 import com.shilapi.xcertplay.ui.components.BannerKind
 import com.shilapi.xcertplay.ui.components.FieldRow
 import com.shilapi.xcertplay.ui.components.HelpText
+import com.shilapi.xcertplay.ui.components.IconVectors
 import com.shilapi.xcertplay.ui.components.KeyValueList
 import com.shilapi.xcertplay.ui.components.LargeTopBar
 import com.shilapi.xcertplay.ui.components.LinearMeter
@@ -123,6 +145,7 @@ import com.shilapi.xcertplay.ui.components.StatusPill
 import com.shilapi.xcertplay.ui.components.SwitchRow
 import com.shilapi.xcertplay.ui.components.TrailingValue
 import com.shilapi.xcertplay.ui.components.tabular
+import com.shilapi.xcertplay.ui.home.HOME_SCREEN_ICONS
 import com.shilapi.xcertplay.ui.home.HomeScreen
 import com.shilapi.xcertplay.ui.home.StreamingLogOverlay
 import com.shilapi.xcertplay.ui.i18n.I18n
@@ -165,9 +188,10 @@ import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 
 /**
- * Full-screen CarPlay host. It renders decoded video through a [TextureView], forwards touch to
+ * Full-screen CarPlay host. It renders decoded video through a [SurfaceView], forwards touch to
  * the active AirPlay session, and drives the complete wired or wireless bring-up through
  * [CarPlayController].
  *
@@ -214,6 +238,7 @@ class CarPlayHostActivity : ComponentActivity() {
         ),
         transport = if (wirelessEnabled) CarPlayTransport.WIRELESS else CarPlayTransport.WIRED,
         wirelessHotspotMode = wirelessHotspotMode,
+        wifiHighPerformanceEnabled = wifiHighPerformanceEnabled,
         manualHotspotSsid = manualHotspotSsid,
         manualHotspotPassphrase = manualHotspotPassphrase,
         manualHotspotBand = manualHotspotBand,
@@ -347,7 +372,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private var clusterPreviewCollapsed = false
     private val webDisplayDrafts = mutableStateMapOf<Int, WebDisplayDraft>()
     private var webDisplayAddresses by mutableStateOf<Map<Int, String>>(emptyMap())
-    private var videoView: TextureView? = null
+    private var videoView: SurfaceView? = null
+    private var videoArea: FrameLayout? = null
     private var contentRoot: FrameLayout? = null
     private var mainFrame: FrameLayout? = null
     private var gestureOverlay: View? = null
@@ -361,7 +387,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var connectionStatus by mutableStateOf("Preparing CarPlay")
     private var handshakeTimeline by mutableStateOf<HandshakeTimeline?>(null)
     private var timelineRevision by mutableIntStateOf(0)
-    private var timelineRenderScheduled = false
+    private var timelineDirty = false
     private var lastAttemptFailure: String? = null
     private var configSummary by mutableStateOf<List<Pair<String, String>>>(emptyList())
     private var manualHotspotError by mutableStateOf<String?>(null)
@@ -379,7 +405,6 @@ class CarPlayHostActivity : ComponentActivity() {
     private var sink: AndroidMediaSink? = null
     private var controller: CarPlayController? = null
     private var currentSurface: Surface? = null
-    private var currentSurfaceTexture: SurfaceTexture? = null
     private var activeDisplaySize: DisplaySize? = null
     private data class DisplayLayout(val splitScreen: Boolean, val portrait: Boolean)
     private fun currentDisplayLayout() = DisplayLayout(
@@ -396,7 +421,13 @@ class CarPlayHostActivity : ComponentActivity() {
     private var hevcSoftwareDecoderEnabled by mutableStateOf(false)
     private var advancedAudioChannelMappingSupported = false
     private var advancedAudioChannelMapping by mutableStateOf(false)
-    private var audioFocusEnabled by mutableStateOf(true)
+    private var audioFocusEnabled by mutableStateOf(false)
+    private var audioQuality by mutableStateOf(AudioQualitySettings())
+    private var audioQualityOpen by mutableStateOf(false)
+    private var audioQualityCapabilities by mutableStateOf<AudioQualityCapabilities.Result?>(null)
+    private var audioQualityChecking by mutableStateOf(false)
+    private var audioQualityProbeFailure by mutableStateOf<String?>(null)
+    private var audioQualityProbeJob: Job? = null
     private var mainMediaAudioBufferDurationMs by mutableIntStateOf(MainMediaAudioBuffer.DEFAULT_DURATION_MS)
     // Snapshot state is safe to read from the media and log threads.
     private var debugLogsEnabled by mutableStateOf(false)
@@ -417,7 +448,80 @@ class CarPlayHostActivity : ComponentActivity() {
     private var hideTopBar by mutableStateOf(true)
     private var hideBottomBar by mutableStateOf(true)
     private var safeAreaDrawOutside by mutableStateOf(true)
-    private var currentVehicleProvider: com.shilapi.xcertplay.vehicle.CarPropertyVehicleProvider? = null
+    private var currentVehicleProvider: com.shilapi.xcertplay.vehicle.source.VehicleDataSource? = null
+    private var diagnosticVehicleProvider: com.shilapi.xcertplay.vehicle.source.VehicleDataSource? = null
+    private var vehicleProfileJson by mutableStateOf("")
+    /** Where [vehicleProfileJson] came from; remembered on Save & Reconnect like other settings. */
+    private var vehicleProfileSource by mutableStateOf("")
+    private var vehicleProfileMessage by mutableStateOf("")
+    private val bundledProfileNames by lazy { VehicleProfileRepository(this).bundledProfiles() }
+    private val vehicleDataEntries by lazy { InstalledVehicleDataEntries.all { selectedVehicleProfile() } }
+    private val vehicleProfileImport = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) lifecycleScope.launch {
+            runCatching { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { VehicleProfileRepository(this@CarPlayHostActivity).import(uri) } }
+                .onSuccess { stopVehicleDiagnostics(); vehicleProfileJson=it; vehicleProfileSource=VehicleProfileRepository.IMPORTED; vehicleProfileMessage="Validated draft. Save & Reconnect applies it." }
+                .onFailure { vehicleProfileMessage="Import rejected; previous profile retained: ${it.message}" }
+        }
+    }
+    /**
+     * Many head units ship without a document picker, so launching OPEN_DOCUMENT throws
+     * ActivityNotFoundException on the main thread. Probe first and never kill the Activity.
+     */
+    private fun launchDocumentPicker(
+        launcher: androidx.activity.result.ActivityResultLauncher<Array<String>>,
+        mimeTypes: Array<String>,
+        onUnavailable: (String) -> Unit = {},
+    ) {
+        val probe = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType(mimeTypes.firstOrNull() ?: "*/*")
+            .putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes)
+        if (probe.resolveActivity(packageManager) == null) { onUnavailable("no document picker on this device"); return }
+        runCatching { launcher.launch(mimeTypes) }.onFailure { onUnavailable("${it.javaClass.simpleName}: ${it.message}") }
+    }
+    /**
+     * Fallback import for picker-less head units: the profile is read from the app's external
+     * files directory, which adb can push into without any storage permission.
+     */
+    private fun importVehicleProfileFromDisk(reason: String) {
+        val file = VehicleProfileRepository(this).externalImportFile()
+        lifecycleScope.launch {
+            runCatching { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { VehicleProfileRepository(this@CarPlayHostActivity).importFile(file) } }
+                .onSuccess {
+                    stopVehicleDiagnostics(); vehicleProfileJson=it; vehicleProfileSource=VehicleProfileRepository.IMPORTED
+                    vehicleProfileMessage="Loaded ${file.name}. Save & Reconnect applies it. (picker unavailable: $reason)"
+                }
+                .onFailure {
+                    vehicleProfileMessage="Picker unavailable ($reason). Push a profile to ${file.absolutePath}, then tap Import JSON again. ${it.message}"
+                }
+        }
+    }
+    private fun loadVehicleProfile() {
+        val selection = VehicleProfileRepository(this).load()
+        vehicleProfileJson = selection.text
+        vehicleProfileSource = selection.source
+        vehicleProfileMessage = selection.message.orEmpty()
+    }
+    private fun selectedVehicleProfile() = com.shilapi.xcertplay.vehicle.profile.VehicleProfileParser.parse(vehicleProfileJson)
+    private fun selectedVehicleDataEntry() =
+        com.shilapi.xcertplay.vehicle.source.VehicleDataEntries.select(vehicleDataEntries, vehicleDataConfig.sourceId)
+    private fun createVehicleDataSource(diagnostic: Boolean=false): com.shilapi.xcertplay.vehicle.source.VehicleDataSource =
+        // The source is handed to the long-lived controller; never let it capture the Activity.
+        selectedVehicleDataEntry().create(com.shilapi.xcertplay.vehicle.source.VehicleDataSourceRequest(
+            applicationContext, vehicleDataConfig, diagnostic))
+    private fun stopVehicleDiagnostics() { diagnosticVehicleProvider?.close(); diagnosticVehicleProvider=null }
+    private fun startVehicleDiagnostics() {
+        stopVehicleDiagnostics()
+        val provider=createVehicleDataSource(true);diagnosticVehicleProvider=provider;provider.start()
+        lifecycleScope.launch {
+            repeat(600) {
+                kotlinx.coroutines.delay(1000)
+                if(diagnosticVehicleProvider !== provider) return@launch
+                updateVehicleDataStatus()
+            }
+            if(diagnosticVehicleProvider===provider) { stopVehicleDiagnostics(); vehicleProfileMessage="Diagnostic sampling finished (10 minutes). Stored values are no longer live." }
+        }
+    }
     private var currentGpsProvider: VehicleLocationProvider? = null
     private var currentWheelProvider: com.shilapi.xcertplay.transport.VehicleSpeedLocationProvider? = null
     private var vehicleDataStatusText by mutableStateOf("")
@@ -429,6 +533,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var microphonePermissionResolved = false
     private var microphoneGainPercent by mutableIntStateOf(MicrophoneGain.DEFAULT_PERCENT)
     private var wirelessEnabled by mutableStateOf(false)
+    private var wifiHighPerformanceEnabled by mutableStateOf(true)
     private var mfiTarget by mutableStateOf(MfiTarget.USB_CH341)
     private var mfiI2cPath by mutableStateOf(AirPlayPersistence.DEFAULT_MFI_I2C_PATH)
     private var remoteMfiServer by mutableStateOf("")
@@ -459,6 +564,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private var restartGeneration = 0
     private var reconnectScheduled = false
     private var reconnectAttempts = 0
+    /** Automatic retries ran out; the home screen offers a manual reconnect instead. */
+    private var reconnectExhausted by mutableStateOf(false)
     private var screenLogs by mutableStateOf<List<ScreenLogLine>>(emptyList())
     private val sessionLog get() = CarPlayBackgroundSession.log
     private var gestureSequenceActive = false
@@ -468,10 +575,11 @@ class CarPlayHostActivity : ComponentActivity() {
     private var edgeSettingsGestureCaptured = false
     private var edgeSettingsGestureEligible = false
     private val shuttingDown = AtomicBoolean(false)
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val teardownExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private val airPlayCommandExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private val diagnosticUploadExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    // Only exitApplication shuts these down, and Activities are recreated often (language,
+    // back and reopen), so their single worker retires when idle instead of leaking per instance.
+    private val teardownExecutor: ExecutorService = idleRetiringSingleThreadExecutor()
+    private val airPlayCommandExecutor: ExecutorService = idleRetiringSingleThreadExecutor()
+    private val diagnosticUploadExecutor: ExecutorService = idleRetiringSingleThreadExecutor()
     private val synologyUploader = SynologyQuickConnectClient()
     private var synologyQcId by mutableStateOf("")
     private var synologyUsername by mutableStateOf("")
@@ -479,79 +587,88 @@ class CarPlayHostActivity : ComponentActivity() {
     private var synologyFolder by mutableStateOf("/docker/navitool-dashboard/data/logs")
     private var synologyOverrideUrl by mutableStateOf("")
     private var synologyUploadInProgress by mutableStateOf(false)
+
+    private fun idleRetiringSingleThreadExecutor(): ExecutorService =
+        java.util.concurrent.ThreadPoolExecutor(
+            1, 1, IDLE_WORKER_KEEP_ALIVE_SECONDS, java.util.concurrent.TimeUnit.SECONDS,
+            java.util.concurrent.LinkedBlockingQueue(),
+        ).apply { allowCoreThreadTimeOut(true) }
     private val logLines = ScreenLogBuffer(MAX_SCREEN_LOG_LINES)
+    // Log receipt and log display are decoupled: any thread only queues records, and the UI
+    // takes them in one batch per LOG_FRAME_MILLIS, however fast the session logs.
     private val pendingScreenLogs = ArrayDeque<PendingLog>()
+    private val pendingHandshakeLogs = ArrayDeque<PendingRecord>()
     private val pendingScreenLogsLock = Any()
-    private var screenDrainPosted = false
-    private val drainScreenLogs = Runnable {
-        val pending = synchronized(pendingScreenLogsLock) {
-            screenDrainPosted = false
-            pendingScreenLogs.toList().also { pendingScreenLogs.clear() }
+    private var logFrameScheduled = false
+    @Volatile private var lastLogFrameAt = 0L
+    private var lastTimelinePublishAt = 0L
+    private var inLogFrame = false
+    private var screenLogsDirty = false
+    private val logFrame = Runnable {
+        val (handshake, screen) = synchronized(pendingScreenLogsLock) {
+            logFrameScheduled = false
+            (pendingHandshakeLogs.toList() to pendingScreenLogs.toList()).also {
+                pendingHandshakeLogs.clear()
+                pendingScreenLogs.clear()
+            }
         }
-        if (debugLogsEnabled && !menuOpen) {
-            pending.forEach { entry ->
-                if (entry.generation == restartGeneration) {
-                    appendScreenLog(entry.timestampMillis, entry.message)
+        val now = SystemClock.uptimeMillis()
+        lastLogFrameAt = now
+        inLogFrame = true
+        try {
+            handshake.forEach { recordHandshake(it.generation, it.record, it.timestampMillis) }
+            if (debugLogsEnabled && !menuOpen) {
+                screen.forEach { entry ->
+                    if (entry.generation == restartGeneration) {
+                        appendScreenLog(entry.timestampMillis, entry.message)
+                    }
                 }
             }
+        } finally {
+            inLogFrame = false
+        }
+        if (timelineDirty) {
+            timelineDirty = false
+            timelineRevision++
+            lastTimelinePublishAt = now
+        }
+        if (screenLogsDirty) {
+            screenLogsDirty = false
+            refreshLogView(System.currentTimeMillis())
         }
     }
     private val expireOldLogLines = Runnable { refreshLogView(System.currentTimeMillis()) }
-    private var logRenderScheduled = false
-    private val renderLogLines = Runnable {
-        logRenderScheduled = false
-        refreshLogView(System.currentTimeMillis())
-    }
+    private var mainStreamReadyAt = 0L
+    private val revealMainStream = Runnable { maybeRevealMainStream() }
     private val applyDisplaySize = Runnable {
         val size = pendingDisplaySize ?: return@Runnable
         pendingDisplaySize = null
         applyDisplaySize(size)
     }
 
-    private val textureListener = object : TextureView.SurfaceTextureListener {
-        override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
-            val existing = currentSurface
-            val surface = if (
-                existing != null &&
-                currentSurfaceTexture === texture &&
-                existing.isValid
-            ) {
-                existing
-            } else {
-                Surface(texture).also {
-                    existing?.release()
-                    currentSurface = it
-                    currentSurfaceTexture = texture
-                }
-            }
-            appendLog(if (existing === surface) "Texture surface reused" else "Texture surface created")
+    // The holder owns the surface; it is only handed to the decoder, never released here.
+    private val surfaceCallback = object : SurfaceHolder.Callback {
+        override fun surfaceCreated(holder: SurfaceHolder) {
+            val surface = holder.surface
+            currentSurface = surface
+            val refreshHz = window.decorView.display?.refreshRate
+            appendLog("Video surface created refreshRate=${refreshHz ?: "unknown"}Hz")
             attachSurface(surface)
             updateWebDisplayPreviews()
-            scheduleDisplaySize(width, height)
         }
 
-        override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
-            updateWebDisplayPreviews()
-            scheduleDisplaySize(width, height)
-        }
+        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
 
-        override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
-            if (currentSurfaceTexture !== texture) return true
-            currentSurface?.let { surface ->
-                detachSurface(SCREEN_TYPE_MAIN, surface)
-                surface.release()
-            }
+        override fun surfaceDestroyed(holder: SurfaceHolder) {
+            currentSurface?.let { detachSurface(SCREEN_TYPE_MAIN, it) }
             currentSurface = null
-            currentSurfaceTexture = null
-            appendLog("Texture surface destroyed")
-            return true
+            appendLog("Video surface destroyed")
         }
-
-        override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        IconVectors.preload(applicationContext.resources, HOME_SCREEN_ICONS)
         initializeSessionLog()
         I18n.init(this)
         darkMode = isDarkMode(resources.configuration.uiMode)
@@ -570,6 +687,7 @@ class CarPlayHostActivity : ComponentActivity() {
                     if (menuOpen) {
                         when {
                             safeAreaEditorActive -> closeSafeAreaEditor()
+                            audioQualityOpen -> audioQualityOpen = false
                             settingsCategory != null && !settingsTwoPane -> settingsCategory = null
                             else -> cancelSettingsEdits()
                         }
@@ -611,6 +729,7 @@ class CarPlayHostActivity : ComponentActivity() {
             advancedAudioChannelMappingSupported &&
                 AirPlayPersistence.loadAdvancedAudioChannelMapping(this)
         audioFocusEnabled = AirPlayPersistence.loadAudioFocusEnabled(this)
+        audioQuality = AirPlayPersistence.loadAudioQuality(this)
         mainMediaAudioBufferDurationMs =
             AirPlayPersistence.loadMainMediaAudioBufferDurationMs(this)
         microphoneGainPercent = AirPlayPersistence.loadMicrophoneGainPercent(this)
@@ -635,10 +754,12 @@ class CarPlayHostActivity : ComponentActivity() {
         hideTopBar = AirPlayPersistence.loadHideTopBar(this)
         hideBottomBar = AirPlayPersistence.loadHideBottomBar(this)
         safeAreaDrawOutside = AirPlayPersistence.loadSafeAreaDrawOutside(this)
+        loadVehicleProfile()
         vehicleDataConfig = AirPlayPersistence.loadVehicleDataConfig(this)
         locationReportingEnabled = AirPlayPersistence.loadLocationReportingEnabled(this)
         locationPermissionAvailable = hasFineLocationPermission()
         wirelessEnabled = AirPlayPersistence.loadWirelessEnabled(this)
+        wifiHighPerformanceEnabled = AirPlayPersistence.loadWifiHighPerformanceEnabled(this)
         mfiTarget = AirPlayPersistence.loadMfiTarget(this)
         mfiI2cPath = AirPlayPersistence.loadMfiI2cPath(this)
         remoteMfiServer = AirPlayPersistence.loadRemoteMfiServer(this)
@@ -779,9 +900,9 @@ class CarPlayHostActivity : ComponentActivity() {
             styleClusterPreviewControls()
         }
         applyFullscreenMode()
-        videoView?.post {
-            val view = videoView ?: return@post
-            scheduleDisplaySize(view.width, view.height)
+        mainFrame?.post {
+            val frame = mainFrame ?: return@post
+            scheduleDisplaySize(frame.width, frame.height)
         }
     }
 
@@ -792,6 +913,7 @@ class CarPlayHostActivity : ComponentActivity() {
 
     override fun onDestroy() {
         GeelyWheelKeys.stop()
+        stopVehicleDiagnostics()
         diagnosticUploadExecutor.shutdownNow()
         CarPlayBackgroundSession.audioFocus(this).release(this)
         stopMicrophoneGainTest()
@@ -799,21 +921,16 @@ class CarPlayHostActivity : ComponentActivity() {
         clusterPreviewSurface?.let { detachSurface(SCREEN_TYPE_ALT, it); it.release() }
         clusterPreviewSurface = null
         mainHandler.removeCallbacks(expireOldLogLines)
-        mainHandler.removeCallbacks(renderLogLines)
-        mainHandler.removeCallbacks(drainScreenLogs)
-        mainHandler.removeCallbacks(publishTimeline)
-        currentSurface?.let { surface ->
-            detachSurface(SCREEN_TYPE_MAIN, surface)
-            surface.release()
-        }
+        mainHandler.removeCallbacks(logFrame)
+        mainHandler.removeCallbacks(revealMainStream)
+        currentSurface?.let { detachSurface(SCREEN_TYPE_MAIN, it) }
         currentSurface = null
-        currentSurfaceTexture = null
         sessionLog.append("Activity destroyed; background session and log remain active")
         super.onDestroy()
     }
 
     /**
-     * View layers keep the video plumbing (TextureViews, touch forwarding, overlays drawn over
+     * View layers keep the video plumbing (video surfaces, touch forwarding, overlays drawn over
      * video); everything else is one Compose layer on top. The window is edge-to-edge: the video
      * is padded by the system bars and display cutout, Compose content by `safeDrawing`.
      */
@@ -822,19 +939,18 @@ class CarPlayHostActivity : ComponentActivity() {
             setBackgroundColor(NO_VIDEO_BACKGROUND)
         }
         contentRoot = root
-        val video = TextureView(this).apply {
-            isOpaque = false
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            )
-            surfaceTextureListener = textureListener
+        val video = SurfaceView(this).apply {
+            holder.addCallback(surfaceCallback)
+        }
+        // Spans the active area; the video inside spans the whole stream and is clipped to it.
+        val area = FrameLayout(this).apply {
+            addView(video, fullFrameParams())
         }
         val gestureLayer = View(this).apply {
             isClickable = true
             setOnTouchListener { view, event -> onHostTouch(view, event) }
         }
-        val frame = FrameLayout(this).apply { addView(video) }
+        val frame = FrameLayout(this).apply { addView(area, fullFrameParams()) }
         frame.addView(
             gestureLayer,
             FrameLayout.LayoutParams(
@@ -845,6 +961,8 @@ class CarPlayHostActivity : ComponentActivity() {
         frame.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
             if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
                 updateMediaMetricsOverlayLayout(right - left, bottom - top)
+                updateWebDisplayPreviews()
+                scheduleDisplaySize(right - left, bottom - top)
             }
         }
         mainFrame = frame
@@ -902,6 +1020,7 @@ class CarPlayHostActivity : ComponentActivity() {
             }
         }
         videoView = video
+        videoArea = area
         gestureOverlay = gestureLayer
         safeAreaEditor = editor
         handshakeTimeline = HandshakeTimeline(wirelessEnabled, System.currentTimeMillis())
@@ -1109,6 +1228,7 @@ class CarPlayHostActivity : ComponentActivity() {
         AirPlayPersistence.saveWebDisplay(this, SCREEN_TYPE_MAIN, mainWebDisplay)
         AirPlayPersistence.saveWebDisplay(this, SCREEN_TYPE_ALT, clusterWebDisplay)
         AirPlayPersistence.saveWirelessEnabled(this, wirelessEnabled)
+        AirPlayPersistence.saveWifiHighPerformanceEnabled(this, wifiHighPerformanceEnabled)
         AirPlayPersistence.saveMfiTarget(this, mfiTarget)
         AirPlayPersistence.saveMfiI2cPath(this, mfiI2cPath)
         AirPlayPersistence.saveRemoteMfiServer(this, remoteMfiServer)
@@ -1126,6 +1246,7 @@ class CarPlayHostActivity : ComponentActivity() {
         AirPlayPersistence.saveAutoStartOnBoot(this, autoStartOnBoot)
         AirPlayPersistence.saveAdvancedAudioChannelMapping(this, advancedAudioChannelMapping)
         AirPlayPersistence.saveAudioFocusEnabled(this, audioFocusEnabled)
+        AirPlayPersistence.saveAudioQuality(this, audioQuality)
         AirPlayPersistence.saveMainMediaAudioBufferDurationMs(
             this,
             mainMediaAudioBufferDurationMs,
@@ -1224,9 +1345,8 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private fun updateWebDisplayAddresses() {
-        val key = AirPlayPersistence.webDisplayKey(this)
         webDisplayAddresses = listOf(SCREEN_TYPE_MAIN, SCREEN_TYPE_ALT).associateWith { type ->
-            CarPlayWebDisplayFactory.urls(type, key).joinToString("\n")
+            CarPlayWebDisplayFactory.urls(type).joinToString("\n")
         }
     }
 
@@ -1316,62 +1436,12 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private fun updateVehicleDataStatus() {
-        if (menuOpen && lastVehicleDataDiagnostics != null) {
-            val speedPermission = if (!canRequestVehicleSpeedPermission()) "not applicable on this device"
-                else if (checkSelfPermission("android.car.permission.CAR_SPEED") == PackageManager.PERMISSION_GRANTED) "granted"
-                else "not granted"
-            vehicleDataStatusText = "Settings pauses CarPlay. The data below was captured before it stopped; " +
-                "Save & Reconnect acquires new readings.\n" + lastVehicleDataDiagnostics +
-                "\nCurrent vehicle speed permission: $speedPermission" +
-                "\nNext connection source: ${vehicleDataConfig.platform.name.replace('_', ' ')}" +
-                "\nEnabled for next connection: ${vehicleDataConfig.enabled.filter { it.sourceImplemented }.joinToString { it.label }}"
-            return
-        }
-        val provider = currentVehicleProvider
-        val sample = provider?.snapshot()
-        val telemetry = provider?.telemetry()
-        val errors = telemetry?.unavailableProperties?.values?.distinct()?.joinToString(", ")
-        val reason = telemetry?.sourceUnavailableReason ?: errors?.takeIf { it.isNotBlank() } ?: "no fresh reading / unsupported property"
-        fun disabled(feature: VehicleDataFeature) = !vehicleDataConfig.isEnabled(feature)
-        fun missingState(ids: Set<Int>, continuous: Boolean = false, maxAge: Long = 30_000): String {
-            val now = android.os.SystemClock.elapsedRealtime()
-            val stale = telemetry?.readings?.values?.filter { it.propertyId in ids }?.any {
-                now - it.elapsedRealtimeMillis !in 0..maxAge ||
-                    (continuous && it.sourceEventMillis?.let { event -> now - event !in 0..maxAge } == true)
-            } == true
-            return if (stale) "stale" else "unavailable"
-        }
-        val subscription = if (provider?.subscriptionActive == true) "phone subscribed" else "waiting for phone subscription"
-        vehicleDataStatusText = buildString {
-            append("Last connection diagnostics\n")
-            append("GPS · Android location: ")
-            append(when {
-                !locationReportingEnabled -> "disabled"
-                !hasFineLocationPermission() -> "precise location permission required"
-                currentGpsProvider == null -> "unavailable — connect to acquire a source"
-                else -> currentGpsProvider!!.state().name.lowercase().replace('_', ' ')
-            })
-            append("\nCar source: ").append(provider?.platform?.name?.replace('_', ' ') ?: "not connected")
-            append("\nWheel speed & gear: ")
-            val speed = provider?.latestSpeed()
-            append(when {
-                disabled(VehicleDataFeature.WHEEL_SPEED) -> "disabled"
-                canRequestVehicleSpeedPermission() && checkSelfPermission("android.car.permission.CAR_SPEED") != PackageManager.PERMISSION_GRANTED -> "vehicle speed permission required"
-                speed == null -> "${missingState(setOf(com.shilapi.xcertplay.vehicle.VehicleTelemetrySnapshot.STANDARD_SPEED), true, 2_000)} — $reason"
-                else -> "${String.format(java.util.Locale.US, "%.1f", speed.metersPerSecond * 3.6)} km/h · ${speed.gear.letter} · ${if (currentWheelProvider?.isPhoneSubscribed == true) "phone subscribed" else "waiting for phone subscription"}"
-            })
-            append("\nEV battery & range: ")
-            append(when {
-                disabled(VehicleDataFeature.EV_STATUS) -> "disabled"
-                sample?.batteryPercent == null && sample?.electricRangeKm == null -> "unavailable — no verified SOC/range property for this source"
-                else -> "SOC ${sample?.batteryPercent?.let { "$it%" } ?: "unknown"} · range ${sample?.electricRangeKm?.let { "$it km" } ?: "unknown"} · $subscription"
-            })
-            append("\nOutside temperature: ")
-            append(when {
-                disabled(VehicleDataFeature.OUTSIDE_TEMPERATURE) -> "disabled"
-                sample?.outsideTemperatureCelsius == null -> "${missingState(setOf(com.shilapi.xcertplay.vehicle.VehicleTelemetrySnapshot.STANDARD_OUTSIDE_TEMPERATURE), true)} — $reason"
-                else -> "${sample.outsideTemperatureCelsius} °C · $subscription"
-            })
+        val provider=diagnosticVehicleProvider ?: currentVehicleProvider
+        if(provider==null) { vehicleDataStatusText="Settings pauses CarPlay. Start a separate 10-minute read-only diagnostic session. No data is sent to the phone during this session.\n" + (lastVehicleDataDiagnostics ?: "No previous connection samples.");return }
+        vehicleDataStatusText=buildString {
+            append(if(diagnosticVehicleProvider!=null) "Independent diagnostic session (no phone output)" else "Connection snapshot")
+            append("\nSource: ").append(selectedVehicleDataEntry().displayName)
+            append("\n").append(provider.diagnostics())
         }
     }
 
@@ -1712,6 +1782,10 @@ class CarPlayHostActivity : ComponentActivity() {
             rightHandDrive = rightHandDrive,
             hevc = hevcEnabled,
             microphone = microphoneAvailable,
+            // 用进程级缓存而不是设置页状态：是否按实测收窄，不能取决于这次有没有点进音频质量页。
+            // 本进程还没探测过时为 null，保持协议默认声明。
+            audioQuality = effectiveAudioQuality(buildQualityOptions(AudioQualityCapabilities.cached())),
+            audioSupportedFormats = AudioQualityCapabilities.cached()?.allowedFormatBits,
             manufacturer = normalizedManufacturer(),
             model = normalizedModel(),
             oemLabel = oemLabel,
@@ -1762,9 +1836,9 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private fun currentActivitySize(): DisplaySize? {
-        val view = videoView
-        if (view != null && view.width > 0 && view.height > 0) {
-            return DisplaySize(view.width, view.height)
+        val frame = mainFrame
+        if (frame != null && frame.width > 0 && frame.height > 0) {
+            return DisplaySize(frame.width, frame.height)
         }
         return activeDisplaySize
     }
@@ -1859,9 +1933,9 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private fun refreshDisplaySizeAfterLayout() {
-        videoView?.post {
-            val view = videoView ?: return@post
-            scheduleDisplaySize(view.width, view.height)
+        mainFrame?.post {
+            val frame = mainFrame ?: return@post
+            scheduleDisplaySize(frame.width, frame.height)
         }
     }
 
@@ -1878,7 +1952,6 @@ class CarPlayHostActivity : ComponentActivity() {
         val outputs = CarPlayWebDisplayFactory.create(
             context = applicationContext,
             configs = mapOf(SCREEN_TYPE_MAIN to mainWebDisplay, SCREEN_TYPE_ALT to clusterWebDisplay),
-            key = AirPlayPersistence.webDisplayKey(this),
             sendTouch = { CarPlayBackgroundSession.snapshot()?.controller?.sendTouch(it) ?: false },
         )
         return try {
@@ -1922,6 +1995,7 @@ class CarPlayHostActivity : ComponentActivity() {
                     }
                     activeAirPlaySession = session
                     reconnectAttempts = 0
+                    reconnectExhausted = false
                     syncAirPlayDarkMode()
                     if (menuOpen) return@runOnUiThread
                     appendLog("AirPlay session active")
@@ -1958,19 +2032,17 @@ class CarPlayHostActivity : ComponentActivity() {
             override fun onDebugLog(message: String) {
                 val now = System.currentTimeMillis()
                 appendFileLog(message, now)
-                if (HandshakeTimeline.isRelevant(message)) {
-                    mainHandler.post { recordHandshake(controllerGeneration, message, now) }
-                }
-                if (!debugLogsEnabled) return
-                val summary = ScreenLogPolicy.summary(message) ?: return
+                // Decoded here, on the session thread, so the log frame only updates the model.
+                val handshake = if (HandshakeTimeline.isRelevant(message)) HandshakeTimeline.prepare(message) else null
+                val summary = if (debugLogsEnabled) ScreenLogPolicy.summary(message) else null
+                if (handshake == null && summary == null) return
                 synchronized(pendingScreenLogsLock) {
-                    if (!debugLogsEnabled) return
-                    pendingScreenLogs.addLast(PendingLog(controllerGeneration, now, summary))
-                    if (pendingScreenLogs.size > MAX_SCREEN_LOG_LINES) pendingScreenLogs.removeFirst()
-                    if (!screenDrainPosted) {
-                        screenDrainPosted = true
-                        mainHandler.post(drainScreenLogs)
+                    if (handshake != null) pendingHandshakeLogs.addLast(PendingRecord(controllerGeneration, now, handshake))
+                    if (summary != null && debugLogsEnabled) {
+                        pendingScreenLogs.addLast(PendingLog(controllerGeneration, now, summary))
+                        if (pendingScreenLogs.size > MAX_SCREEN_LOG_LINES) pendingScreenLogs.removeFirst()
                     }
+                    scheduleLogFrameLocked()
                 }
             }
         }
@@ -2052,30 +2124,25 @@ class CarPlayHostActivity : ComponentActivity() {
         val config = createRuntimeConfig()
         val areas = createViewAreas(size)
         val airPlayConfig = createAirPlayConfig(size, areas)
-        val vehicleProvider = if (vehicleDataConfig.isEnabled(VehicleDataFeature.EV_STATUS) ||
-            vehicleDataConfig.isEnabled(VehicleDataFeature.WHEEL_SPEED) ||
-            vehicleDataConfig.isEnabled(VehicleDataFeature.OUTSIDE_TEMPERATURE)) {
-            com.shilapi.xcertplay.vehicle.CarPropertyVehicleProvider(
-                com.shilapi.xcertplay.vehicle.CarPropertyDataStore(
-                    com.shilapi.xcertplay.vehicle.AndroidCarPropertyBackend(this),
-                    vehicleDataConfig.platform, android.os.SystemClock::elapsedRealtime,
-                ), vehicleDataConfig, android.os.SystemClock::elapsedRealtime,
-            ).also { it.start() }
-        } else null
+        stopVehicleDiagnostics()
+        val vehicleProvider = createVehicleDataSource().also { it.start() }
+
         lastVehicleDataDiagnostics = null
         currentVehicleProvider = vehicleProvider
         currentGpsProvider = null
         val positionProvider: Iap2LocationProvider? =
             if (config.locationReportingEnabled) {
                 VehicleLocationProvider(
-                    AndroidCarPlayLocationProvider(this), vehicleDataConfig,
+                    AndroidCarPlayLocationProvider(
+                        this, precise = vehicleDataConfig.isEnabled(VehicleDataFeature.PRECISE_POSITIONING),
+                    ), vehicleDataConfig,
                     android.os.SystemClock::elapsedRealtime,
                 ).also { currentGpsProvider = it }
             } else {
                 null
             }
         currentWheelProvider = null
-        val locationProvider = if (vehicleProvider != null && vehicleDataConfig.isEnabled(VehicleDataFeature.WHEEL_SPEED))
+        val locationProvider = if (vehicleDataConfig.isEnabled(VehicleDataFeature.WHEEL_SPEED))
             com.shilapi.xcertplay.transport.VehicleSpeedLocationProvider(positionProvider, vehicleProvider).also { currentWheelProvider = it }
             else positionProvider
         appendLog(
@@ -2105,6 +2172,11 @@ class CarPlayHostActivity : ComponentActivity() {
         val renderer = try {
             createMediaSink(airPlayConfig, controllerGeneration)
         } catch (error: Exception) {
+            // Nothing owns these providers yet; release the car service binding and worker.
+            vehicleProvider.close()
+            currentVehicleProvider = null
+            currentGpsProvider = null
+            currentWheelProvider = null
             appendLog("Could not create web displays: ${error.message}")
             failHandshake("Could not start web displays", error.message ?: "Check resolution and port 8080")
             setConnectionStage("Could not start web displays; check resolution and port 8080")
@@ -2115,8 +2187,11 @@ class CarPlayHostActivity : ComponentActivity() {
         clusterPreviewSurface?.let { attachDisplaySurface(SCREEN_TYPE_ALT, it) }
         updateWebDisplayPreviews()
         val media = createMediaEngine(renderer)
-        val pairings = AirPlayPersistence.loadPairings(this) { id, key ->
-            AirPlayPersistence.savePairing(this, id, key)
+        // The controller outlives this Activity in CarPlayBackgroundSession, so its callbacks
+        // must hold only the application context.
+        val app = applicationContext
+        val pairings = AirPlayPersistence.loadPairings(app) { id, key ->
+            AirPlayPersistence.savePairing(app, id, key)
         }
         val next = CarPlayController(
             context = this,
@@ -2127,9 +2202,9 @@ class CarPlayHostActivity : ComponentActivity() {
             listener = createSessionListener(controllerGeneration),
             media = media,
             reportStatus = createStatusReporter(controllerGeneration),
-            loadPairRecord = { AirPlayPersistence.loadLockdownRecord(this) },
-            savePairRecord = { record -> AirPlayPersistence.saveLockdownRecord(this, record) },
-            clearPairRecord = { AirPlayPersistence.clearLockdownRecord(this) },
+            loadPairRecord = { AirPlayPersistence.loadLockdownRecord(app) },
+            savePairRecord = { record -> AirPlayPersistence.saveLockdownRecord(app, record) },
+            clearPairRecord = { AirPlayPersistence.clearLockdownRecord(app) },
             locationProvider = locationProvider,
             vehicleStatusProvider = vehicleProvider,
         )
@@ -2291,7 +2366,13 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun reconnectAfterLoss(reason: String) {
         if (shuttingDown.get() || menuOpen || handshakeResetInProgress) return
-        if (reconnectScheduled) return
+        if (reconnectScheduled || reconnectExhausted) return
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            reconnectExhausted = true
+            setConnectionStage("$reason; stopped after $MAX_RECONNECT_ATTEMPTS attempts")
+            appendLog("$reason; stopped retrying after $MAX_RECONNECT_ATTEMPTS attempts, waiting for manual reconnect")
+            return
+        }
         reconnectScheduled = true
         val generation = restartGeneration
         val delayMillis = if (reason.contains("AirPlay iAP tunnel", ignoreCase = true)) {
@@ -2300,8 +2381,9 @@ class CarPlayHostActivity : ComponentActivity() {
             minOf(
                 RECONNECT_DELAY_MILLIS shl reconnectAttempts.coerceAtMost(RECONNECT_MAX_SHIFT),
                 RECONNECT_MAX_DELAY_MILLIS,
-            ).also { reconnectAttempts++ }
+            )
         }
+        reconnectAttempts++
         appendLog("$reason; retrying in ${delayMillis}ms")
         mainHandler.postDelayed(
             {
@@ -2319,6 +2401,14 @@ class CarPlayHostActivity : ComponentActivity() {
             },
             delayMillis,
         )
+    }
+
+    /** The home screen's retry button: reconnects now, and that try opens a fresh retry budget. */
+    private fun reconnectManually() {
+        if (!reconnectExhausted || shuttingDown.get() || menuOpen || handshakeResetInProgress) return
+        reconnectExhausted = false
+        reconnectAttempts = 1
+        restartCarPlay("Manual reconnect")
     }
 
     /** Full-stack fallback when an AirPlay-only reconnect is unavailable. */
@@ -2369,6 +2459,9 @@ class CarPlayHostActivity : ComponentActivity() {
         updateVehicleDataStatus()
         handshakeResetInProgress = true
         startAfterHandshakeReset = false
+        reconnectScheduled = false
+        reconnectAttempts = 0
+        reconnectExhausted = false
         hotspotStatus = HotspotStatus(state = if (wirelessEnabled) "stopped" else "off")
         val generation = ++restartGeneration
         controller?.sendTouch(emptyList())
@@ -2383,6 +2476,12 @@ class CarPlayHostActivity : ComponentActivity() {
         setConnectionStage("Reconnecting after settings")
         gestureOverlay?.visibility = View.GONE
         settingsCategory = null
+        audioQualityOpen = false
+        audioQualityCapabilities = null
+        audioQualityChecking = false
+        audioQualityProbeFailure = null
+        audioQualityProbeJob?.cancel()
+        audioQualityProbeJob = null
         mfiError = null
         manualHotspotError = null
         resetWebDisplayDrafts()
@@ -2421,6 +2520,8 @@ class CarPlayHostActivity : ComponentActivity() {
         if (!validateMfiSettings()) return
         if (!validateManualHotspotSettings()) return
         if (!validateWebDisplaySettings()) return
+        VehicleProfileRepository(this).save(VehicleProfileRepository.Selection(vehicleProfileJson, vehicleProfileSource))
+        stopVehicleDiagnostics()
         persistMenuSettings()
         settingsBaseline = null
         finishSettingsMenu("Settings saved")
@@ -2428,6 +2529,8 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun cancelSettingsEdits() {
         if (!menuOpen) return
+        stopVehicleDiagnostics()
+        loadVehicleProfile()
         restoreSettingsBaseline()
         finishSettingsMenu("Settings changes discarded")
     }
@@ -2437,6 +2540,10 @@ class CarPlayHostActivity : ComponentActivity() {
         stopMicrophoneGainTest()
         menuOpen = false
         settingsCategory = null
+        audioQualityOpen = false
+        audioQualityChecking = false
+        audioQualityProbeJob?.cancel()
+        audioQualityProbeJob = null
         gestureOverlay?.visibility = View.VISIBLE
         updateWebDisplayPreviews()
         updateDebugOverlays()
@@ -2500,24 +2607,27 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun detachSurface(type: Int, surface: Surface) {
         val outputs = CarPlayWebDisplayFactory.find(sink)
-        if (outputs?.owns(type) == true) outputs.preview(type, null) else sink?.clearSurface(type, surface)
+        if (outputs?.owns(type) == true) outputs.releasePreview(type, surface) else sink?.clearSurface(type, surface)
     }
 
     private fun updateWebDisplayPreviews() {
         val view = videoView
         view?.visibility = if (!mainWebDisplay.enabled || mainWebDisplay.preview) View.VISIBLE else View.INVISIBLE
-        val matrix = android.graphics.Matrix()
-        val placement = view?.let { mainAreaPlacement(it.width, it.height) }
-        if (view != null && placement != null) {
-            // The decoder output fills the view by default; scale so only the active area does.
-            val (rect, share) = placement
-            matrix.setScale(
-                (rect[2] / view.width / share[0]).toFloat(),
-                (rect[3] / view.height / share[1]).toFloat(),
-            )
-            matrix.postTranslate(rect[0].toFloat(), rect[1].toFloat())
+        val area = videoArea
+        val placement = mainFrame?.let { mainAreaPlacement(it.width, it.height) }
+        if (view != null && area != null) {
+            // The decoder output fills the SurfaceView, so the view spans the whole stream while
+            // its parent spans the active area. The parent clips the hole the view punches in the
+            // opaque window, which hides the rest of the stream.
+            if (placement == null) {
+                placeView(area, 0, 0, MATCH_PARENT, MATCH_PARENT)
+                placeView(view, 0, 0, MATCH_PARENT, MATCH_PARENT)
+            } else {
+                val (rect, share) = placement
+                placeView(area, rect[0].roundToInt(), rect[1].roundToInt(), rect[2].roundToInt(), rect[3].roundToInt())
+                placeView(view, 0, 0, (rect[2] / share[0]).roundToInt(), (rect[3] / share[1]).roundToInt())
+            }
         }
-        view?.setTransform(matrix)
         clusterPreviewWindow?.let { window ->
             val shown = clusterWebDisplay.enabled && clusterWebDisplay.preview
             window.visibility = if (shown && !clusterPreviewCollapsed) View.VISIBLE else View.GONE
@@ -2526,6 +2636,19 @@ class CarPlayHostActivity : ComponentActivity() {
         }
         currentSurface?.let { webDisplays?.preview(SCREEN_TYPE_MAIN, it) }
         clusterPreviewSurface?.let { webDisplays?.preview(SCREEN_TYPE_ALT, it) }
+    }
+
+    private fun fullFrameParams() = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.TOP or Gravity.LEFT)
+
+    /** Moves a child of a FrameLayout, requesting layout only when its placement changes. */
+    private fun placeView(view: View, left: Int, top: Int, width: Int, height: Int) {
+        val params = view.layoutParams as FrameLayout.LayoutParams
+        if (params.leftMargin == left && params.topMargin == top && params.width == width && params.height == height) return
+        params.leftMargin = left
+        params.topMargin = top
+        params.width = width
+        params.height = height
+        view.layoutParams = params
     }
 
     /**
@@ -2699,9 +2822,45 @@ class CarPlayHostActivity : ComponentActivity() {
 
     /** Re-derives what the overlay shows; the Compose layer reads the state set here. */
     private fun updateDebugOverlays() {
-        mainStreamActive = SCREEN_TYPE_MAIN in activeScreenStreamTypes
+        if (SCREEN_TYPE_MAIN !in activeScreenStreamTypes) {
+            mainHandler.removeCallbacks(revealMainStream)
+            mainStreamReadyAt = 0L
+            mainStreamActive = false
+        } else if (!mainStreamActive) {
+            if (mainStreamReadyAt == 0L) mainStreamReadyAt = SystemClock.uptimeMillis()
+            maybeRevealMainStream()
+            return
+        }
         applySystemBarAppearance()
         updateMediaMetricsOverlay()
+    }
+
+    /**
+     * Video replaces the home screen only once the handshake list has shown its last record for
+     * LOG_FRAME_MILLIS, so the final step is seen; a session that never stops logging waits at
+     * most MAIN_STREAM_REVEAL_MAX_WAIT_MILLIS.
+     */
+    private fun maybeRevealMainStream() {
+        mainHandler.removeCallbacks(revealMainStream)
+        if (mainStreamActive || SCREEN_TYPE_MAIN !in activeScreenStreamTypes) return
+        val now = SystemClock.uptimeMillis()
+        val pending = synchronized(pendingScreenLogsLock) { pendingHandshakeLogs.isNotEmpty() }
+        val settledAt = if (pending || timelineDirty) now + LOG_FRAME_MILLIS else lastTimelinePublishAt + LOG_FRAME_MILLIS
+        val revealAt = minOf(settledAt, mainStreamReadyAt + MAIN_STREAM_REVEAL_MAX_WAIT_MILLIS)
+        if (revealAt > now) {
+            mainHandler.postDelayed(revealMainStream, revealAt - now)
+            return
+        }
+        mainStreamReadyAt = 0L
+        mainStreamActive = true
+        applySystemBarAppearance()
+        updateMediaMetricsOverlay()
+    }
+
+    private fun scheduleLogFrameLocked() {
+        if (logFrameScheduled) return
+        logFrameScheduled = true
+        mainHandler.postAtTime(logFrame, maxOf(SystemClock.uptimeMillis(), lastLogFrameAt + LOG_FRAME_MILLIS))
     }
 
     /** Dark bar icons only over our own light surfaces; video and the safe-area editor are dark. */
@@ -2714,22 +2873,16 @@ class CarPlayHostActivity : ComponentActivity() {
         }
     }
 
-    private fun recordHandshake(controllerGeneration: Int, message: String, atMillis: Long) {
+    private fun recordHandshake(controllerGeneration: Int, record: HandshakeTimeline.Prepared, atMillis: Long) {
         if (controllerGeneration != restartGeneration) return
         val timeline = handshakeTimeline ?: return
-        if (timeline.accept(message, atMillis)) notifyTimelineChanged()
+        if (timeline.accept(record, atMillis)) notifyTimelineChanged()
     }
 
-    private val publishTimeline = Runnable {
-        timelineRenderScheduled = false
-        timelineRevision++
-    }
-
-    /** Coalesces bursts of handshake records into one UI update. */
+    /** The next log frame publishes the change, together with whatever else arrived. */
     private fun notifyTimelineChanged() {
-        if (timelineRenderScheduled) return
-        timelineRenderScheduled = true
-        mainHandler.postDelayed(publishTimeline, TIMELINE_RENDER_INTERVAL_MILLIS)
+        timelineDirty = true
+        if (!inLogFrame) synchronized(pendingScreenLogsLock) { scheduleLogFrameLocked() }
     }
 
     private fun failHandshake(title: String, detail: String) {
@@ -2791,10 +2944,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun appendScreenLog(timestampMillis: Long, message: String) {
         val summary = ScreenLogPolicy.summary(message) ?: return
         logLines.add(timestampMillis, formattedLogLine(summary, timestampMillis))
-        if (!logRenderScheduled) {
-            logRenderScheduled = true
-            mainHandler.postDelayed(renderLogLines, LOG_RENDER_INTERVAL_MILLIS)
-        }
+        screenLogsDirty = true
+        if (!inLogFrame) synchronized(pendingScreenLogsLock) { scheduleLogFrameLocked() }
     }
 
     private fun appendFileLog(message: String, timestampMillis: Long) =
@@ -2832,13 +2983,10 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun clearScreenLogs() {
         synchronized(pendingScreenLogsLock) {
             pendingScreenLogs.clear()
-            screenDrainPosted = false
         }
-        mainHandler.removeCallbacks(drainScreenLogs)
         logLines.clear()
         mainHandler.removeCallbacks(expireOldLogLines)
-        mainHandler.removeCallbacks(renderLogLines)
-        logRenderScheduled = false
+        screenLogsDirty = false
         screenLogs = emptyList()
     }
 
@@ -2886,11 +3034,21 @@ class CarPlayHostActivity : ComponentActivity() {
 
     @Composable
     private fun HostOverlay() {
+        // The home screen stays composed while it fades out over the video already decoding below.
+        val homeAlpha = remember { Animatable(if (mainStreamActive) 0f else 1f) }
+        LaunchedEffect(mainStreamActive) {
+            if (mainStreamActive) {
+                homeAlpha.animateTo(0f, tween(STREAM_REVEAL_FADE_MILLIS, easing = LinearEasing))
+            } else {
+                homeAlpha.snapTo(1f)
+            }
+        }
+        val homeVisible = !mainStreamActive || homeAlpha.targetValue != 0f || homeAlpha.isRunning
         Box(Modifier.fillMaxSize()) {
             when {
                 safeAreaEditorActive -> SafeAreaEditorChrome()
                 menuOpen -> SettingsScreen()
-                !mainStreamActive -> HomeScreen(
+                homeVisible -> HomeScreen(
                     timeline = handshakeTimeline,
                     revision = timelineRevision,
                     status = connectionStatus,
@@ -2898,6 +3056,9 @@ class CarPlayHostActivity : ComponentActivity() {
                     debugLogs = debugLogsEnabled,
                     logLines = screenLogs,
                     onOpenSettings = { openSettingsMenu() },
+                    onRetry = if (reconnectExhausted) ::reconnectManually else null,
+                    // Read in the draw phase only: the fade redraws frames without recomposing.
+                    modifier = Modifier.graphicsLayer { alpha = homeAlpha.value },
                 )
                 debugLogsEnabled -> StreamingLogOverlay(screenLogs, Modifier.align(Alignment.BottomStart))
             }
@@ -2934,7 +3095,7 @@ class CarPlayHostActivity : ComponentActivity() {
                                         support = category.summary,
                                         leadingIcon = category.icon,
                                         selected = category == selected,
-                                        onClick = { settingsCategory = category },
+                                        onClick = { settingsCategory = category; audioQualityOpen = false },
                                     )
                                 }
                             }
@@ -2950,7 +3111,12 @@ class CarPlayHostActivity : ComponentActivity() {
                         ) {
                             ProvideGroupColor(scheme.surfaceContainerHigh) {
                                 Column(Modifier.fillMaxSize()) {
-                                    SmallTopBar(title = selected.title)
+                                    SmallTopBar(
+                                        title = if (audioQualityOpen) tr("settings.audio.quality") else selected.title,
+                                        navigation = if (audioQualityOpen) {
+                                            { LvIconButton(R.drawable.ic_ms_arrow_back, tr("common.back"), { audioQualityOpen = false }) }
+                                        } else null,
+                                    )
                                     CategoryContent(selected, Modifier.weight(1f))
                                 }
                             }
@@ -2973,7 +3139,7 @@ class CarPlayHostActivity : ComponentActivity() {
                                         support = category.summary,
                                         leadingIcon = category.icon,
                                         leadingBox = true,
-                                        onClick = { settingsCategory = category },
+                                        onClick = { settingsCategory = category; audioQualityOpen = false },
                                         trailing = { TrailingValue(null) },
                                     )
                                 }
@@ -2981,9 +3147,11 @@ class CarPlayHostActivity : ComponentActivity() {
                             }
                         } else {
                             SmallTopBar(
-                                title = current.title,
+                                title = if (audioQualityOpen) tr("settings.audio.quality") else current.title,
                                 navigation = {
-                                    LvIconButton(R.drawable.ic_ms_arrow_back, tr("common.back"), { settingsCategory = null })
+                                    LvIconButton(R.drawable.ic_ms_arrow_back, tr("common.back"), {
+                                        if (audioQualityOpen) audioQualityOpen = false else settingsCategory = null
+                                    })
                                 },
                             )
                             CategoryContent(current, Modifier.weight(1f))
@@ -3046,7 +3214,7 @@ class CarPlayHostActivity : ComponentActivity() {
 
     @Composable
     private fun CategoryContent(category: SettingsCategory, modifier: Modifier) {
-        key(category) {
+        key(category, audioQualityOpen) {
             Column(
                 modifier
                     .fillMaxWidth()
@@ -3056,7 +3224,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 when (category) {
                     SettingsCategory.CONNECTION -> ConnectionSettings()
                     SettingsCategory.VEHICLE -> VehicleSettings()
-                    SettingsCategory.AUDIO -> AudioSettings()
+                    SettingsCategory.AUDIO -> if (audioQualityOpen) AudioQualitySettingsContent() else AudioSettings()
                     SettingsCategory.DISPLAY -> DisplaySettings()
                     SettingsCategory.WEB -> WebDisplaySettings()
                     SettingsCategory.IDENTITY -> IdentitySettings()
@@ -3124,13 +3292,17 @@ class CarPlayHostActivity : ComponentActivity() {
                     row {
                         DocumentRow(tr("settings.mfi.certificate"), localMfiCertificateUri) {
                             externalActivityInProgress = true
-                            localMfiCertificatePicker.launch(arrayOf("*/*"))
+                            launchDocumentPicker(localMfiCertificatePicker, arrayOf("*/*")) {
+                                externalActivityInProgress = false; mfiError = "No document picker on this device: $it"
+                            }
                         }
                     }
                     row {
                         DocumentRow(tr("settings.mfi.private_key"), localMfiPrivateKeyUri) {
                             externalActivityInProgress = true
-                            localMfiPrivateKeyPicker.launch(arrayOf("*/*"))
+                            launchDocumentPicker(localMfiPrivateKeyPicker, arrayOf("*/*")) {
+                                externalActivityInProgress = false; mfiError = "No document picker on this device: $it"
+                            }
                         }
                     }
                     row { HelpText(tr("settings.mfi.local_help")) }
@@ -3150,6 +3322,14 @@ class CarPlayHostActivity : ComponentActivity() {
                     support = tr("settings.wireless.support"),
                     checked = wirelessEnabled,
                     onCheckedChange = ::onWirelessChanged,
+                )
+            }
+            row {
+                SwitchRow(
+                    title = tr("settings.wifi_high_performance"),
+                    support = tr("settings.wifi_high_performance.support"),
+                    checked = wifiHighPerformanceEnabled,
+                    onCheckedChange = { wifiHighPerformanceEnabled = it },
                 )
             }
             row {
@@ -3309,25 +3489,70 @@ class CarPlayHostActivity : ComponentActivity() {
                     onCheckedChange = ::onLocationReportingChanged,
                 )
             }
+            row {
+                SwitchRow(
+                    title = tr("settings.vehicle.precise_positioning"),
+                    support = tr("settings.vehicle.precise_positioning.support"),
+                    checked = vehicleDataConfig.isEnabled(VehicleDataFeature.PRECISE_POSITIONING),
+                    onCheckedChange = { onVehicleFeatureChanged(VehicleDataFeature.PRECISE_POSITIONING, it) },
+                    enabled = locationReportingEnabled,
+                )
+            }
         }
 
         SectionHeader(tr("settings.vehicle.properties"))
-        val platforms = com.shilapi.xcertplay.vehicle.VehiclePlatform.entries
+        val profile = runCatching { selectedVehicleProfile() }.getOrNull()
+        val vehicleEntry = selectedVehicleDataEntry()
         SettingsGroup {
-            row {
-                SelectRow(
-                    title = tr("settings.vehicle.source"),
-                    options = listOf(platforms[0] to tr("settings.vehicle.source.aaos")),
-                    selected = vehicleDataConfig.platform,
-                    onSelected = { platform ->
-                        vehicleDataConfig = vehicleDataConfig.copy(platform = platform)
-                        updateVehicleDataStatus()
-                    },
-                )
+            if (vehicleDataEntries.size > 1) {
+                row { ListRow(headline = tr("settings.vehicle.source"), support = vehicleEntry.displayName) }
+                row { FlowButtons {
+                    vehicleDataEntries.forEach { entry ->
+                        val select = {
+                            stopVehicleDiagnostics()
+                            vehicleDataConfig = vehicleDataConfig.copy(sourceId = entry.id)
+                            updateVehicleDataStatus()
+                        }
+                        if (entry.id == vehicleEntry.id) FilledTonalButton(onClick = select) { Text(entry.displayName) }
+                        else OutlinedButton(onClick = select) { Text(entry.displayName) }
+                    }
+                } }
             }
-            VehicleDataFeature.entries.forEach { feature ->
+            if (vehicleEntry is JsonProfileVehicleDataEntry) {
+            row { ListRow(headline = "Vehicle JSON profile", support = (profile?.name ?: "No profile") +
+                if (vehicleProfileSource == VehicleProfileRepository.IMPORTED) " · imported" else "") }
+            row { FlowButtons {
+                OutlinedButton(onClick = {
+                    launchDocumentPicker(vehicleProfileImport,
+                        arrayOf("application/json", "text/*", "application/octet-stream")) { reason ->
+                        importVehicleProfileFromDisk(reason)
+                    }
+                }) { Text("Import JSON") }
+                bundledProfileNames.forEach { (fileName, label) ->
+                    val select = {
+                        stopVehicleDiagnostics()
+                        VehicleProfileRepository(this@CarPlayHostActivity).bundled(fileName)?.let {
+                            vehicleProfileJson = it
+                            vehicleProfileSource = VehicleProfileRepository.BUNDLED_PREFIX + fileName
+                            vehicleProfileMessage = "$label draft selected. Save & Reconnect applies it."
+                        }
+                        Unit
+                    }
+                    if (vehicleProfileSource == VehicleProfileRepository.BUNDLED_PREFIX + fileName) FilledTonalButton(onClick = select) { Text(label) }
+                    else OutlinedButton(onClick = select) { Text(label) }
+                }
+            } }
+            // What the profile feeds; the feature switches below decide what is actually sent.
+            profile?.signals?.filter { it.target != null }?.forEach { signal -> row {
+                ListRow(headline = signal.target!!.label, support = "${signal.name} [${signal.id}]" +
+                    (signal.unit?.let { " · $it" } ?: ""))
+            } }
+            row { HelpText(vehicleProfileMessage) }
+            }
+            // Precise positioning is a location option and sits under the location switch instead.
+            VehicleDataFeature.entries.filter { it != VehicleDataFeature.PRECISE_POSITIONING }.forEach { feature ->
                 row {
-                    if (!feature.sourceImplemented) {
+                    if (!vehicleEntry.canProvide(feature)) {
                         ListRow(
                             headline = feature.label,
                             support = tr("settings.vehicle.feature_unavailable", "reason" to feature.description),
@@ -3358,10 +3583,10 @@ class CarPlayHostActivity : ComponentActivity() {
             }
             row {
                 FlowButtons {
-                    FilledTonalButton(onClick = { updateVehicleDataStatus() }) {
+                    FilledTonalButton(onClick = { startVehicleDiagnostics() }) {
                         LvIcon(R.drawable.ic_ms_refresh, size = 18.dp)
                         Spacer(Modifier.width(Space.s2))
-                        Text(tr("settings.vehicle.refresh"), style = MaterialTheme.typography.labelLarge)
+                        Text("Start live diagnostics (10 min)", style = MaterialTheme.typography.labelLarge)
                     }
                     if (canRequestVehicleSpeedPermission()) {
                         OutlinedButton(onClick = { requestVehicleSpeedPermission() }) {
@@ -3389,6 +3614,16 @@ class CarPlayHostActivity : ComponentActivity() {
 
     @Composable
     private fun AudioSettings() {
+        SettingsGroup {
+            row {
+                ListRow(
+                    headline = tr("settings.audio.quality"),
+                    support = tr("settings.audio.quality.summary"),
+                    onClick = ::openAudioQualitySettings,
+                    trailing = { TrailingValue(null) },
+                )
+            }
+        }
         SectionHeader(tr("settings.audio.playback"))
         val bufferValues = remember {
             (MainMediaAudioBuffer.MIN_DURATION_MS..MainMediaAudioBuffer.MAX_DURATION_MS step
@@ -3440,6 +3675,210 @@ class CarPlayHostActivity : ComponentActivity() {
             row { MicrophoneTestRow() }
         }
     }
+
+    private enum class QualityStream(val route: AudioQualityProfiles.Route, val key: String) {
+        MUSIC(AudioQualityProfiles.Route.MUSIC, "music"),
+        ASSISTANT(AudioQualityProfiles.Route.ASSISTANT, "assistant"),
+        NAVIGATION(AudioQualityProfiles.Route.NAVIGATION, "navigation"),
+        PHONE(AudioQualityProfiles.Route.PHONE, "phone"),
+        MICROPHONE(AudioQualityProfiles.Route.MICROPHONE, "microphone"),
+    }
+
+    /** 每一路当前可选的声道与采样率：协议允许 ∩ 本机能力 ∩ 用户设置的上限。 */
+    private class QualityOptions(private val byStream: Map<QualityStream, Map<Int, List<Int>>>) {
+        // 预先算好，避免每次重组都过滤排序一遍。
+        private val channelLists = byStream.mapValues { (_, byChannels) ->
+            byChannels.filterValues { it.isNotEmpty() }.keys.sorted()
+        }
+
+        fun channels(stream: QualityStream): List<Int> = channelLists[stream].orEmpty()
+
+        fun rates(stream: QualityStream, channels: Int): List<Int> =
+            byStream[stream]?.get(channels).orEmpty()
+
+        /** 用户设置是上限：在可用项里取不超过它的最大值。 */
+        fun effective(stream: QualityStream, requested: AudioQualityLimit): AudioQualityLimit? {
+            val channels = channels(stream).lastOrNull { it <= requested.channels } ?: return null
+            val rate = rates(stream, channels).lastOrNull { it <= requested.sampleRate } ?: return null
+            return AudioQualityLimit(rate, channels)
+        }
+    }
+
+    private fun openAudioQualitySettings() {
+        audioQualityOpen = true
+        // 先渲染缓存结果，设备没变化时不会出现"检测中"跳变，也不会重复探测。
+        audioQualityCapabilities = AudioQualityCapabilities.cached()
+        requestAudioQualityProbe()
+    }
+
+    /**
+     * 只在实际需要时探测。探测结果按音频设备指纹缓存在 [AudioQualityCapabilities] 里，
+     * 设备不变时这次调用几乎立即返回，不会重复创建 AudioTrack / MediaCodec。
+     */
+    private fun requestAudioQualityProbe(force: Boolean = false) {
+        audioQualityProbeJob?.cancel()
+        audioQualityProbeFailure = null
+        val known = AudioQualityCapabilities.cached()
+        // 已有可用结果时不再显示"检测中"：设备没变化的话这轮只是校验指纹，
+        // 让页面在这里闪一下再展开属实没必要。
+        audioQualityChecking = known == null || known.failure != null
+        audioQualityProbeJob = lifecycleScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                try {
+                    Result.success(AudioQualityCapabilities.probe(applicationContext, force))
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    Result.failure(error)
+                }
+            }
+            audioQualityChecking = false
+            if (!audioQualityOpen) return@launch
+            val result = outcome.getOrNull()
+            // 命中缓存时返回的是同一个实例；跳过赋值可以省掉整页重组。
+            if (result != null && result !== known) audioQualityCapabilities = result
+            outcome.exceptionOrNull()?.let { error ->
+                audioQualityProbeFailure = error.message ?: error.javaClass.simpleName
+                Log.w(TAG, "音频能力检测失败", error)
+            }
+        }
+    }
+
+    private fun qualityLimit(stream: QualityStream): AudioQualityLimit = when (stream) {
+        QualityStream.MUSIC -> audioQuality.music
+        QualityStream.ASSISTANT -> audioQuality.assistant
+        QualityStream.NAVIGATION -> audioQuality.navigation
+        QualityStream.PHONE -> audioQuality.phone
+        QualityStream.MICROPHONE -> audioQuality.microphone
+    }
+
+    private fun setQualityLimit(stream: QualityStream, limit: AudioQualityLimit) {
+        audioQuality = when (stream) {
+            QualityStream.MUSIC -> audioQuality.copy(music = limit)
+            QualityStream.ASSISTANT -> audioQuality.copy(assistant = limit)
+            QualityStream.NAVIGATION -> audioQuality.copy(navigation = limit)
+            QualityStream.PHONE -> audioQuality.copy(phone = limit)
+            QualityStream.MICROPHONE -> audioQuality.copy(microphone = limit)
+        }
+    }
+
+    private fun buildQualityOptions(
+        caps: AudioQualityCapabilities.Result? = audioQualityCapabilities,
+    ): QualityOptions {
+        if (caps == null || caps.failure != null) return QualityOptions(emptyMap())
+        val opus = audioQuality.opusEnabled
+        return QualityOptions(
+            QualityStream.entries.associateWith { stream ->
+                AudioQualityProfiles.channels(stream.route, wirelessEnabled, opus).associateWith { channels ->
+                    AudioQualityProfiles.rates(stream.route, wirelessEnabled, opus)
+                        .filter { it in machineRates(caps, stream.route, channels, opus) }
+                }
+            },
+        )
+    }
+
+    /** 某一路某种声道数下，本机真正能处理的采样率。 */
+    private fun machineRates(
+        caps: AudioQualityCapabilities.Result,
+        route: AudioQualityProfiles.Route,
+        channels: Int,
+        opus: Boolean,
+    ): List<Int> = when {
+        // 无线且关闭 Opus 时，麦克风上行走 ELD 编码，由编码器实测结果决定。
+        route == AudioQualityProfiles.Route.MICROPHONE && wirelessEnabled && !opus -> caps.eldMicrophoneRates
+        route == AudioQualityProfiles.Route.MICROPHONE && !wirelessEnabled -> caps.microphoneCaptureRates
+        else -> caps.rates(AudioQualityProfiles.codec(route, wirelessEnabled, opus), channels)
+    }
+
+    /**
+     * 生成真正写进 /info 的上限。任何一路没有可用组合时退回该路的原始设置，
+     * 而不是让整个配置构造失败：手机自己会再筛一遍。
+     */
+    private fun effectiveAudioQuality(options: QualityOptions): AudioQualitySettings {
+        fun limit(stream: QualityStream): AudioQualityLimit =
+            options.effective(stream, qualityLimit(stream)) ?: qualityLimit(stream)
+        return audioQuality.copy(
+            music = limit(QualityStream.MUSIC),
+            assistant = limit(QualityStream.ASSISTANT),
+            navigation = limit(QualityStream.NAVIGATION),
+            phone = limit(QualityStream.PHONE),
+            microphone = limit(QualityStream.MICROPHONE),
+        )
+    }
+
+    @Composable
+    private fun AudioQualitySettingsContent() {
+        val caps = audioQualityCapabilities
+        val options = remember(caps, audioQuality, wirelessEnabled) { buildQualityOptions() }
+        HelpText(tr("settings.audio.quality.help"))
+        val compatibleAvailable = caps?.compatibleModeAvailable == true
+        SettingsGroup {
+            row {
+                SwitchRow(
+                    title = tr("settings.audio.quality.opus"),
+                    support = tr("settings.audio.quality.opus.support"),
+                    checked = audioQuality.opusEnabled,
+                    // 关闭 Opus 需要本机真的能用 ELD 收和发；打开永远允许。
+                    enabled = !audioQualityChecking && (!audioQuality.opusEnabled || compatibleAvailable),
+                    onCheckedChange = { audioQuality = audioQuality.copy(opusEnabled = it) },
+                )
+            }
+        }
+        // 有线 CarPlay 全部走 LPCM，这条只对无线有意义。
+        if (!audioQualityChecking && wirelessEnabled && !compatibleAvailable) {
+            HelpText(tr("settings.audio.quality.compatibility_unavailable"))
+        }
+        when {
+            audioQualityChecking -> {
+                HelpText(tr("settings.audio.quality.checking"))
+                return
+            }
+            caps == null || caps.failure != null -> {
+                HelpText(tr("settings.audio.quality.check_failed"))
+                (caps?.failure ?: audioQualityProbeFailure)?.let {
+                    HelpText(tr("settings.audio.quality.check_failed_reason", "reason" to it))
+                }
+                TextButton(onClick = { requestAudioQualityProbe(force = true) }) { Text(tr("settings.audio.quality.retry")) }
+                return
+            }
+        }
+        for (stream in QualityStream.entries) {
+            val requested = qualityLimit(stream)
+            val channels = options.channels(stream)
+            val effective = options.effective(stream, requested)
+            val selectedChannels = effective?.channels ?: channels.firstOrNull() ?: requested.channels
+            SectionHeader(tr("settings.audio.quality.${stream.key}"))
+            val rates = options.rates(stream, selectedChannels)
+            SettingsGroup {
+                row {
+                    SelectRow(
+                        title = tr("settings.audio.quality.sample_rate"),
+                        options = rates.map { it to rateLabel(it) },
+                        selected = effective?.sampleRate ?: requested.sampleRate,
+                        support = if (effective == null) tr("settings.audio.quality.unsupported") else null,
+                        enabled = rates.isNotEmpty(),
+                        onSelected = { setQualityLimit(stream, requested.copy(sampleRate = it)) },
+                    )
+                }
+                row {
+                    SelectRow(
+                        title = tr("settings.audio.quality.channels"),
+                        options = channels.map {
+                            it to tr(if (it == 1) "settings.audio.quality.mono" else "settings.audio.quality.stereo")
+                        },
+                        selected = selectedChannels,
+                        enabled = channels.size > 1,
+                        onSelected = { setQualityLimit(stream, requested.copy(channels = it)) },
+                    )
+                }
+            }
+        }
+        SectionHeader(tr("settings.audio.quality.bitrate"))
+        SettingsGroup { row { ListRow(headline = tr("settings.audio.quality.automatic")) } }
+    }
+
+    private fun rateLabel(rate: Int): String =
+        if (rate % 1000 == 0) "${rate / 1000} kHz" else String.format(java.util.Locale.US, "%.1f kHz", rate / 1000.0)
 
     @Composable
     private fun MicrophoneTestRow() {
@@ -3747,7 +4186,14 @@ class CarPlayHostActivity : ComponentActivity() {
                 Row(horizontalArrangement = Arrangement.spacedBy(Space.s2)) {
                     FilledTonalButton(onClick = {
                         externalActivityInProgress = true
-                        imagePicker.launch("image/*")
+                        val intent = Intent(Intent.ACTION_GET_CONTENT).setType("image/*")
+                        if (intent.resolveActivity(packageManager) == null) {
+                            externalActivityInProgress = false
+                            appendLog("No image picker on this device")
+                        } else runCatching { imagePicker.launch("image/*") }.onFailure {
+                            externalActivityInProgress = false
+                            appendLog("Image picker failed: ${it.javaClass.simpleName}")
+                        }
                     }) { Text(tr("settings.identity.icon.choose"), style = MaterialTheme.typography.labelLarge) }
                     TextButton(
                         onClick = {
@@ -4206,19 +4652,23 @@ class CarPlayHostActivity : ComponentActivity() {
         const val CLUSTER_WINDOW_MAX_HEIGHT_FRACTION = 0.35
         const val CLUSTER_WINDOW_MIN_WIDTH_DP = 160
         const val LOG_RETENTION_MILLIS = 5 * 60_000L
-        const val LOG_RENDER_INTERVAL_MILLIS = 100L
+        /** One UI refresh of the handshake list and screen log, however fast records arrive. */
+        const val LOG_FRAME_MILLIS = 200L
+        const val MAIN_STREAM_REVEAL_MAX_WAIT_MILLIS = 1_500L
+        const val STREAM_REVEAL_FADE_MILLIS = 200
+        const val IDLE_WORKER_KEEP_ALIVE_SECONDS = 30L
         const val MAX_SCREEN_LOG_LINES = 100
         const val DISPLAY_CHANGE_DEBOUNCE_MILLIS = 500L
         const val RECONNECT_DELAY_MILLIS = 2_000L
         const val RECONNECT_MAX_DELAY_MILLIS = 30_000L
         const val RECONNECT_MAX_SHIFT = 4
+        const val MAX_RECONNECT_ATTEMPTS = 3
         const val IAP_TUNNEL_RECONNECT_DELAY_MILLIS = 15_000L
         const val CONTROLLER_CLOSE_TIMEOUT_MILLIS = 4_000L
         const val AUDIO_CAPTURE_DIRECTORY = "audio-captures"
         const val THREE_FINGER_COUNT = 3
         const val THREE_FINGER_SWIPE_DISTANCE_DP = 72
         const val THREE_FINGER_SWIPE_DIRECTION_RATIO = 1.15f
-        const val TIMELINE_RENDER_INTERVAL_MILLIS = 120L
         val TWO_PANE_MIN_WIDTH = 720.dp
         val CATEGORY_PANE_WIDTH = 320.dp
         val NO_VIDEO_BACKGROUND = Color.BLACK
@@ -4230,6 +4680,11 @@ class CarPlayHostActivity : ComponentActivity() {
         val timestampMillis: Long,
         val message: String,
     )
+    private class PendingRecord(
+        val generation: Int,
+        val timestampMillis: Long,
+        val record: HandshakeTimeline.Prepared,
+    )
     private data class HotspotStatus(
         val state: String,
         val ssid: String? = null,
@@ -4240,7 +4695,7 @@ class CarPlayHostActivity : ComponentActivity() {
 }
 
 /**
- * Collects the current size, all saved safe area sizes, and their swapped orientations.
+ * Collects the current size and every saved safe area size, or its swap, in the current orientation.
  * Areas share the display origin and fit inside its envelope; updateViewArea switches declared sizes.
  */
 class CarPlayViewAreas private constructor(
@@ -4255,7 +4710,7 @@ class CarPlayViewAreas private constructor(
     val activityWidthPixels: Int = activitySizes.maxOf { it.first }
     val activityHeightPixels: Int = activitySizes.maxOf { it.second }
 
-    /** Both orientations are declared, so rotating is an area switch rather than a reconnect. */
+    /** Both orientations are declared, so rotating is an area switch rather than a reconnect. [build] never does this. */
     val turnsWithScreen: Boolean =
         activitySizes.any { (w, h) -> w > h } && activitySizes.any { (w, h) -> w < h }
 
@@ -4294,11 +4749,15 @@ class CarPlayViewAreas private constructor(
             safeArea: (width: Int, height: Int) -> SafeAreaRect?,
         ): CarPlayViewAreas {
             require(currentWidth > 0 && currentHeight > 0) { "Activity dimensions must be positive" }
+            // Only the current orientation is declared: the envelope of a landscape and a portrait
+            // area is a longest-edge square, and the phone encodes that whole square every frame.
+            // Rotating therefore renegotiates instead of switching areas.
+            val orientation = Integer.signum(currentWidth - currentHeight)
             val sizes = linkedSetOf<Pair<Int, Int>>()
             (listOf(currentWidth to currentHeight) + savedSizes).forEach { (w, h) ->
                 if (w > 0 && h > 0) {
-                    sizes += w to h
-                    sizes += h to w
+                    if (Integer.signum(w - h) == orientation) sizes += w to h
+                    if (Integer.signum(h - w) == orientation) sizes += h to w
                 }
             }
             val declared = sizes.toList()

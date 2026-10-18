@@ -12,7 +12,11 @@ import org.bouncycastle.crypto.params.KeyParameter
 import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.X25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
+import java.security.GeneralSecurityException
 import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /** BouncyCastle-backed primitives for the CarPlay pairing and control channel. */
 object AirPlayCrypto {
@@ -20,6 +24,13 @@ object AirPlayCrypto {
     private const val NONCE_SIZE = 12
     private const val LABEL_SIZE = 8
     private val random = SecureRandom()
+
+    /**
+     * Platform AEAD (Conscrypt/BoringSSL on Android 9+) for the per-packet video and audio
+     * decrypt path, one instance per thread. Null where the provider lacks ChaCha20-Poly1305.
+     */
+    private val platformChaCha = ThreadLocal<Cipher?>()
+    @Volatile private var platformChaChaAvailable = true
 
     data class X25519KeyPair(val privateKey: ByteArray, val publicKey: ByteArray)
     data class Ed25519KeyPair(val privateKey: ByteArray, val publicKey: ByteArray)
@@ -93,6 +104,10 @@ object AirPlayCrypto {
         ciphertextAndTag: ByteArray,
         aad: ByteArray = ByteArray(0),
     ): ByteArray {
+        platformCipher(key, nonce)?.let { cipher ->
+            if (aad.isNotEmpty()) cipher.updateAAD(aad)
+            return cipher.doFinal(ciphertextAndTag)
+        }
         val cipher = ChaCha20Poly1305()
         cipher.init(false, AEADParameters(KeyParameter(key), MAC_BITS, nonce, aad))
         val output = ByteArray(cipher.getOutputSize(ciphertextAndTag.size))
@@ -100,6 +115,51 @@ object AirPlayCrypto {
         val finalized = cipher.doFinal(output, processed)
         val outputLength = processed + finalized
         return if (outputLength == output.size) output else output.copyOf(outputLength)
+    }
+
+    /** Reusable high-rate decryptor; [ChaCha20Poly1305] construction is otherwise costly per frame. */
+    class ChaChaOpener(key: ByteArray) {
+        private val cipher = ChaCha20Poly1305()
+        private val keyParameter = KeyParameter(key.copyOf())
+        private val nonce = ByteArray(NONCE_SIZE)
+
+        fun open(
+            counter: Long,
+            ciphertextAndTag: ByteArray,
+            ciphertextLength: Int,
+            aad: ByteArray,
+            output: ByteArray,
+        ): Int {
+            var value = counter
+            for (index in 4 until NONCE_SIZE) {
+                nonce[index] = value.toByte()
+                value = value ushr 8
+            }
+            require(ciphertextLength in 0..ciphertextAndTag.size)
+            // Conscrypt buffers complete AEAD input and allocates a result even for its
+            // caller-output overload. BC writes directly into the recycled output buffer.
+            cipher.init(false, AEADParameters(keyParameter, MAC_BITS, nonce, aad))
+            val processed = cipher.processBytes(ciphertextAndTag, 0, ciphertextLength, output, 0)
+            return processed + cipher.doFinal(output, processed)
+        }
+    }
+
+    /** A platform decrypt cipher initialized for [key]/[nonce], or null to use BouncyCastle. */
+    private fun platformCipher(key: ByteArray, nonce: ByteArray): Cipher? {
+        if (!platformChaChaAvailable) return null
+        val cipher = platformChaCha.get() ?: try {
+            Cipher.getInstance("ChaCha20/Poly1305/NoPadding").also(platformChaCha::set)
+        } catch (_: GeneralSecurityException) {
+            platformChaChaAvailable = false
+            return null
+        }
+        return try {
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "ChaCha20"), IvParameterSpec(nonce))
+            cipher
+        } catch (_: GeneralSecurityException) {
+            // Unusual key/nonce shapes keep the BouncyCastle behavior.
+            null
+        }
     }
 
     /** 12-byte nonce: four zero bytes followed by an eight-byte little-endian counter. */
