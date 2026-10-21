@@ -91,6 +91,7 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -181,6 +182,8 @@ class CarPlayController(
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val touchExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val tunnelExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val watchdogScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    @Volatile private var wiredStartWatchdog: WiredStartWatchdog? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val hostId = UUID.randomUUID().toString().uppercase(Locale.US)
     private val systemBuid = UUID.randomUUID().toString().uppercase(Locale.US)
@@ -255,6 +258,7 @@ class CarPlayController(
 
     private val sessionListener = object : AirPlaySessionListener {
         override fun onSessionActive(session: AirPlaySession) {
+            wiredStartWatchdog?.sessionActive()
             synchronized(performanceLockLifecycle) {
                 if (closed) return
                 activeSession = session
@@ -542,6 +546,8 @@ class CarPlayController(
         permissionPollGeneration += 1
         activeMediaRemoteSession = null
         CarPlayMediaSessionBridge.detach(appContext, this)
+        wiredStartWatchdog?.terminate()
+        watchdogScheduler.shutdownNow()
         touchExecutor.shutdownNow()
         tunnelExecutor.shutdownNow()
         val service = vpnService
@@ -1548,19 +1554,48 @@ class CarPlayController(
                 deviceIdentifier = ncmHostMac.macString(),
             )
             onStatus(CarPlayStatus.RunningControl)
-            debugLog("wired iAP2 control starting")
-            val result = Iap2WiredControlClient(csm, Iap2MfiAuthenticationClient(mfi)).run(
-                identification = config.identification,
-                endpoint = endpoint,
-                availableCurrentMilliAmps = config.availableCurrentMilliAmps,
-                bringUpTimeoutMillis = CONTROL_BRING_UP_TIMEOUT_MILLIS,
-                locationProvider = locationProvider,
-                vehicleStatusProvider = vehicleStatusProvider,
-                onReady = { activateMediaRemote(csm) },
-                onStopped = { deactivateMediaRemote(csm) },
-                onIncoming = ::onIap2Incoming,
-                onProgress = { message -> debugLog("wired $message") },
+            val startWatchdog = WiredStartWatchdog(
+                schedule = { delay, action ->
+                    val future = runCatching {
+                        watchdogScheduler.schedule({ action() }, delay, TimeUnit.MILLISECONDS)
+                    }.getOrNull()
+                    val cancel: () -> Unit = { future?.cancel(false); Unit }
+                    cancel
+                },
+                onTimeout = {
+                    if (!closed && wiredStartWatchdog != null) {
+                        debugLog(
+                            "wired start: no AirPlay session ${WiredStartWatchdog.TIMEOUT_MILLIS / 1000} s " +
+                                "after carplay-start-session; NCM ${ncm.trafficSummary(endpoint.airPlayPort)}",
+                        )
+                        fail(IphoneUsbException.TimedOut("The iPhone did not open CarPlay over USB in time"))
+                    }
+                },
             )
+            wiredStartWatchdog = startWatchdog
+            debugLog("wired iAP2 control starting")
+            val result = try {
+                Iap2WiredControlClient(csm, Iap2MfiAuthenticationClient(mfi)).run(
+                    identification = config.identification,
+                    endpoint = endpoint,
+                    availableCurrentMilliAmps = config.availableCurrentMilliAmps,
+                    bringUpTimeoutMillis = CONTROL_BRING_UP_TIMEOUT_MILLIS,
+                    locationProvider = locationProvider,
+                    vehicleStatusProvider = vehicleStatusProvider,
+                    onReady = { activateMediaRemote(csm) },
+                    onStopped = { deactivateMediaRemote(csm) },
+                    onIncoming = ::onIap2Incoming,
+                    onProgress = { message ->
+                        if (message.contains("0x4301") || message.contains("carplay-start-session")) {
+                            startWatchdog.startSessionSent()
+                        }
+                        debugLog("wired $message")
+                    },
+                )
+            } finally {
+                startWatchdog.terminate()
+                if (wiredStartWatchdog === startWatchdog) wiredStartWatchdog = null
+            }
             onStatus(
                 when (result.terminal) {
                     Iap2WiredControlTerminal.CHANNEL_CLOSED ->

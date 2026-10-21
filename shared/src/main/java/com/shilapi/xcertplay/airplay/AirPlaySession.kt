@@ -77,6 +77,7 @@ class AirPlaySession(
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
     private val touchSendFailureLogged = AtomicBoolean(false)
+    private val touchSlots = AirPlayTouchSlots(AirPlayHid.TOUCH_CONTACTS)
     private val ntp = NtpClock()
     private var keepAliveSocket: DatagramSocket? = null
     private var keepAliveThread: Thread? = null
@@ -150,8 +151,9 @@ class AirPlaySession(
     /** Sends updateViewArea through POST /command, serialized by the [sendCommand] write lock. */
     fun showViewArea(index: Int): Boolean = displayControl.showViewArea(index)
 
+    /** [contacts] carry Android pointer ids; an empty list releases every finger. */
     fun sendTouch(contacts: List<AirPlayContact>): Boolean {
-        val scaled = contacts.map {
+        val scaled = touchSlots.assign(contacts).map {
             it.copy(x = it.x * config.main.widthPixels, y = it.y * config.main.heightPixels)
         }
         val report = AirPlayHid.touchReport(scaled)

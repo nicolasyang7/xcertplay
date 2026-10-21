@@ -34,6 +34,7 @@ class NcmUsbBridge internal constructor(
     private var sequence = 0
     private var loggedWriteTimeout = false
     private val frames = ArrayDeque<ByteArray>()
+    private val traffic = NcmTrafficCounter()
     private var queuedBytes = 0
     private var buffered = ByteArray(0)
     private var bufferedSize = 0
@@ -70,11 +71,15 @@ class NcmUsbBridge internal constructor(
                 "NCM write transferred $transferred of ${block.size} bytes",
             )
         }
+        traffic.sent()
         if (loggedWriteTimeout) {
             loggedWriteTimeout = false
             Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk-out became ready")
         }
     }
+
+    /** Frames to and from the iPhone so far, for a report line; see [NcmTrafficCounter]. */
+    fun trafficSummary(airPlayPort: Int?): String = traffic.summary(airPlayPort)
 
     /**
      * Returns the next complete Ethernet frame, or null when [timeoutMillis] elapses without one.
@@ -190,6 +195,7 @@ class NcmUsbBridge internal constructor(
     private fun pollFrame(): ByteArray {
         val frame = frames.removeFirst()
         queuedBytes -= frame.size
+        traffic.received(frame)
         return frame
     }
 

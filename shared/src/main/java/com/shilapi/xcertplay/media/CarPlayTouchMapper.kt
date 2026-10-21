@@ -33,7 +33,7 @@ object CarPlayTouchMapper {
         val action = event.actionMasked
         val liftedIndex = if (action == MotionEvent.ACTION_POINTER_UP) event.actionIndex else -1
         val allUp = action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL
-        val count = minOf(MAX_CONTACTS, event.pointerCount)
+        val count = event.pointerCount
         if (action == MotionEvent.ACTION_DOWN &&
             (event.x < rect[0] || event.x > rect[0] + rect[2] || event.y < rect[1] || event.y > rect[1] + rect[3])
         ) return emptyList()
@@ -41,7 +41,7 @@ object CarPlayTouchMapper {
         for (index in 0 until count) {
             contacts.add(
                 AirPlayContact(
-                    id = index,
+                    id = event.getPointerId(index),
                     x = ((event.getX(index) - rect[0]) / rect[2]).coerceIn(0.0, 1.0),
                     y = ((event.getY(index) - rect[1]) / rect[3]).coerceIn(0.0, 1.0),
                     down = !allUp && index != liftedIndex,

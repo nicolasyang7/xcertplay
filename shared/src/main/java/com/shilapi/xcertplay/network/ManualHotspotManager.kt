@@ -465,6 +465,7 @@ class ManualHotspotManager(
             "dummy",
             "rmnet",
             "r_rmnet",
+            "ccmni",
             "tun",
             "ppp",
             "sit",
