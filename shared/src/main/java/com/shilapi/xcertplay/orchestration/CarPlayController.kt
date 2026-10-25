@@ -257,6 +257,10 @@ class CarPlayController(
     }
 
     private val sessionListener = object : AirPlaySessionListener {
+        // Trace lines reach logcat and the UI; build them only for `setprop log.tag.DiPlayTrace VERBOSE` or a UI that wants them.
+        override val wantsTrace: Boolean
+            get() = uiListener?.wantsTrace == true || Log.isLoggable(TRACE_LOG_TAG, Log.VERBOSE)
+
         override fun onSessionActive(session: AirPlaySession) {
             wiredStartWatchdog?.sessionActive()
             synchronized(performanceLockLifecycle) {
@@ -2164,6 +2168,7 @@ class CarPlayController(
         private const val NOW_PLAYING_UPDATE = 0x5001
         private const val MEDIA_REMOTE_SEND_TIMEOUT_MILLIS = 2_000L
         private const val HID_REPORT_HOLD_MILLIS = 50L
+        private const val TRACE_LOG_TAG = "DiPlayTrace"
         private const val IAP2_IPHONE_UUID = "00000000-deca-fade-deca-deafdecacafe"
         private const val HOTSPOT_START_TIMEOUT_MILLIS = 60_000L
         private const val WIFI_P2P_START_TIMEOUT_MILLIS = 20_000L

@@ -2032,6 +2032,8 @@ class CarPlayHostActivity : ComponentActivity() {
                 }
             }
 
+            override val wantsTrace: Boolean get() = false
+
             override fun onDebugLog(message: String) {
                 val now = System.currentTimeMillis()
                 appendFileLog(message, now)
