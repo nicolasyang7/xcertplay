@@ -67,6 +67,12 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
+        <provider
+            android:name="com.shilapi.xcertplay.artwork.ArtworkProvider"
+            android:authorities="com.shilapi.xcertplay.artwork"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
         <receiver
             android:name="com.shilapi.xcertplay.BootReceiver"
             android:enabled="true"

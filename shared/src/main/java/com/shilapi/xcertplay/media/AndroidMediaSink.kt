@@ -1378,7 +1378,7 @@ private class AudioRenderer(
         val totalFrames = totalBytesWritten / trackBytesPerFrame
         val headFrames = playbackHeadFrames(track)
         val queuedFrames = (totalFrames - headFrames).coerceAtLeast(0L)
-        trim.sample(queuedFrames, now)
+        trim.sample(queuedFrames, now, headMoving = headFrames > 0L)
         val rate = trim.rateDue(now) ?: return
         val result = runCatching { track.setPlaybackRate(rate) }.getOrDefault(AudioTrack.ERROR)
         if (result != AudioTrack.SUCCESS) {

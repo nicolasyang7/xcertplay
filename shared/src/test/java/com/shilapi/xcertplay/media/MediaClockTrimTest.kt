@@ -18,7 +18,7 @@ class MediaClockTrimTest {
      */
     private class Drive(val drift: Double, val trimmed: Boolean, seed: Int = 7) {
         val target = 14_400L // 300 ms at 48 kHz, as #610's music track started
-        val trim = MediaClockTrim(48_000, target)
+        val trim = MediaClockTrim(48_000, target, measuresTarget = false)
         val random = Random(seed)
         var queued = target.toDouble()
         var starved = 0
@@ -60,7 +60,7 @@ class MediaClockTrimTest {
      */
     private class BurstDrive(targetMs: Int, seed: Int = 7) {
         val target = 48L * targetMs
-        val trim = MediaClockTrim(48_000, target)
+        val trim = MediaClockTrim(48_000, target, measuresTarget = false)
         val random = Random(seed)
         var queued = maxOf(target, 19_200L).toDouble()
         val starvedSeconds = mutableListOf<Int>()
@@ -139,7 +139,7 @@ class MediaClockTrimTest {
     }
 
     @Test fun theTrimStaysWithinOnePointFivePercent() {
-        val trim = MediaClockTrim(48_000, 14_400)
+        val trim = MediaClockTrim(48_000, 14_400, measuresTarget = false)
         // Nothing queued for minutes: the trim stops at its bound.
         for (second in 0..600) {
             val nowNs = second * 1_000_000_000L
@@ -150,7 +150,7 @@ class MediaClockTrimTest {
     }
 
     @Test fun withoutNewAudioTheTrimHolds() {
-        val trim = MediaClockTrim(48_000, 14_400)
+        val trim = MediaClockTrim(48_000, 14_400, measuresTarget = false)
         trim.sample(7_200, 0)
         assertEquals(47_280, trim.rateDue(0))
         // The iPhone paused: no write for 2 s, so no update even though the last level was low.
@@ -162,7 +162,7 @@ class MediaClockTrimTest {
     }
 
     @Test fun aLongPauseDoesNotCountAsDrift() {
-        val trim = MediaClockTrim(48_000, 14_400)
+        val trim = MediaClockTrim(48_000, 14_400, measuresTarget = false)
         trim.sample(14_400, 0)
         trim.rateDue(0)
         // Five minutes later music resumes with a short first burst: one step, not 300 s, is integrated.
@@ -174,13 +174,13 @@ class MediaClockTrimTest {
 
     @Test fun aNewStreamStartsFromTheLearnedTrim() {
         MediaClockTrim.learnedTrim = -0.0075
-        val trim = MediaClockTrim(48_000, 14_400)
+        val trim = MediaClockTrim(48_000, 14_400, measuresTarget = false)
         trim.sample(14_400, 0)
         assertEquals(47_640, trim.rateDue(0))
     }
 
     @Test fun updatesComeAtMostOnceASecond() {
-        val trim = MediaClockTrim(48_000, 14_400)
+        val trim = MediaClockTrim(48_000, 14_400, measuresTarget = false)
         trim.sample(7_200, 0)
         assertEquals(47_280, trim.rateDue(0))
         trim.sample(14_400, 500_000_000L)
@@ -188,7 +188,7 @@ class MediaClockTrimTest {
     }
 
     @Test fun aLargeCompressedQueueMustNotTrickClockControlIntoSlowingDownFurther() {
-        val trim = MediaClockTrim(48_000, 14_400)
+        val trim = MediaClockTrim(48_000, 14_400, measuresTarget = false)
         // The #806 recording had 150-192 pending AAC packets while Android's track writes
         // reported a small hardware PCM queue. Those packets are not 'missing' music.
         for (second in 1..12) {

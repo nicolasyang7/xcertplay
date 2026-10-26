@@ -235,6 +235,7 @@ class CarPlayHostActivity : ComponentActivity() {
             hardwareVersion = "1.0",
             carPlayUsbInterfaceNumber = 3,
             locationInformationEnabled = locationReportingEnabled,
+            vehicleSpeedEnabled = locationReportingEnabled && (vehicleDataConfig.isEnabled(VehicleDataFeature.WHEEL_SPEED) || EcarxWheelSpeed.present()),
         ),
         transport = if (wirelessEnabled) CarPlayTransport.WIRELESS else CarPlayTransport.WIRED,
         wirelessHotspotMode = wirelessHotspotMode,
@@ -913,6 +914,7 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        Lynk09ChannelGuard.stop()
         GeelyWheelKeys.stop()
         stopVehicleDiagnostics()
         diagnosticUploadExecutor.shutdownNow()
@@ -2117,6 +2119,9 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun startCarPlay(size: DisplaySize) {
         if (shuttingDown.get() || menuOpen || handshakeResetInProgress || controller != null) return
+        if (wirelessEnabled) {
+            Lynk09ChannelGuard.start()
+        }
         val controllerGeneration = restartGeneration
         handshakeTimeline = HandshakeTimeline(wirelessEnabled, System.currentTimeMillis(), lastAttemptFailure)
         lastAttemptFailure = null
@@ -2143,9 +2148,16 @@ class CarPlayHostActivity : ComponentActivity() {
                 null
             }
         currentWheelProvider = null
-        val locationProvider = if (vehicleDataConfig.isEnabled(VehicleDataFeature.WHEEL_SPEED))
-            com.shilapi.xcertplay.transport.VehicleSpeedLocationProvider(positionProvider, vehicleProvider).also { currentWheelProvider = it }
-            else positionProvider
+        val locationProvider = when {
+            vehicleDataConfig.isEnabled(VehicleDataFeature.WHEEL_SPEED) ->
+                com.shilapi.xcertplay.transport.VehicleSpeedLocationProvider(positionProvider, vehicleProvider).also { currentWheelProvider = it }
+            locationReportingEnabled && EcarxWheelSpeed.present() ->
+                com.shilapi.xcertplay.transport.VehicleSpeedLocationProvider(
+                    positionProvider ?: EcarxWheelSpeed.NoPosition,
+                    EcarxWheelSpeed.attach(applicationContext),
+                ).also { currentWheelProvider = it }
+            else -> positionProvider
+        }
         appendLog(
             "Starting CarPlay controller at ${size.width}x${size.height} -> " +
                 "${airPlayConfig.main.widthPixels}x${airPlayConfig.main.heightPixels} " +

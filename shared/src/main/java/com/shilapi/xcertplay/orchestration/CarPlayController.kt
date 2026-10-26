@@ -466,6 +466,7 @@ class CarPlayController(
                         artwork.fileTransferId,
                         artwork.bytes,
                     )
+                    com.shilapi.xcertplay.artwork.ArtworkProvider.updateArtwork(appContext, artwork.bytes)
                 },
                 onLog = ::debugLog,
             ).also { fileTransferReceivers[session] = it }
